@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -26,7 +26,7 @@ jobs:
       - name: HTTP acceptance against D1 and R2 emulation
         shell: bash
         run: |
-          npm run dev -- --port 3001 > /tmp/openwood-dev.log 2>&1 &
+          ./node_modules/.bin/wrangler dev --config dist/server/wrangler.json --ip 127.0.0.1 --port 3001 > /tmp/openwood-server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           ready=0
@@ -38,8 +38,8 @@ jobs:
             sleep 1
           done
           if [ "$ready" -ne 1 ]; then
-            cat /tmp/openwood-dev.log
+            cat /tmp/openwood-server.log
             exit 1
           fi
-          npm run test:smoke || { cat /tmp/openwood-dev.log; exit 1; }
+          npm run test:smoke || { cat /tmp/openwood-server.log; exit 1; }
       - run: npm audit --omit=dev --audit-level=high
