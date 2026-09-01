@@ -1,0 +1,20 @@
+services:
+  openwood:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      # Wrangler otherwise keeps ordinary container environment variables out
+      # of the local Worker binding namespace used by cloudflare:workers.
+      CLOUDFLARE_INCLUDE_PROCESS_ENV: "true"
+      OPENWOOD_PUBLIC_ORIGIN: ${OPENWOOD_PUBLIC_ORIGIN:-http://localhost:8787}
+      OPENWOOD_MAX_RUNS_PER_DAY: ${OPENWOOD_MAX_RUNS_PER_DAY:-24}
+      OPENWOOD_MAX_DEPLOYMENT_RUNS_PER_DAY: ${OPENWOOD_MAX_DEPLOYMENT_RUNS_PER_DAY:-250}
+      OPENWOOD_LLM_BASE_URL: ${OPENWOOD_LLM_BASE_URL:-}
+      OPENWOOD_LLM_MODEL: ${OPENWOOD_LLM_MODEL:-}
+      OPENWOOD_LLM_API_KEY: ${OPENWOOD_LLM_API_KEY:-}
+    volumes:
+      - openwood_state:/app/.wrangler
+
+volumes:
+  openwood_state:

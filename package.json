@@ -1,0 +1,50 @@
+{
+  "name": "openwood-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source agent production house for cinematic micro-dramas.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "vinext dev",
+    "build": "vinext build",
+    "start": "wrangler dev --config dist/server/wrangler.json",
+    "lint": "oxlint",
+    "format": "oxfmt",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:smoke": "node tests/http-smoke.mjs",
+    "check": "npm run typecheck && npm run test && npm run lint && npm run build",
+    "db:generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-server-dom-webpack": "19.2.8",
+    "vinext": "1.0.0-beta.8",
+    "drizzle-orm": "0.45.2",
+    "lucide-react": "1.31.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.54.3",
+    "@cloudflare/workers-types": "5.20260901.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.34",
+    "oxfmt": "0.61.0",
+    "oxlint": "1.76.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "tailwindcss": "4.2.1",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vite": "8.2.2",
+    "wrangler": "4.128.0",
+    "drizzle-kit": "0.31.10"
+  },
+  "type": "module"
+}

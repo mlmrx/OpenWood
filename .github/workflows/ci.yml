@@ -1,0 +1,45 @@
+name: quality-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: HTTP acceptance against D1 and R2 emulation
+        shell: bash
+        run: |
+          npm run dev -- --port 3001 > /tmp/openwood-dev.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in {1..90}; do
+            if curl --fail --silent http://127.0.0.1:3001/api/health >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/openwood-dev.log
+            exit 1
+          fi
+          npm run test:smoke || { cat /tmp/openwood-dev.log; exit 1; }
+      - run: npm audit --omit=dev --audit-level=high
