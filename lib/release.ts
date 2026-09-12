@@ -8,6 +8,15 @@ function manifestArtifact(bundle: ProjectBundle): ArtifactRecord | undefined {
   return bundle.artifacts.find((artifact) => artifact.kind === 'release-manifest');
 }
 
+export function releaseManifestPinsArtifact(bundle: ProjectBundle, artifact: ArtifactRecord): boolean {
+  const manifest = manifestArtifact(bundle);
+  if (!manifest || manifest.status !== 'locked' || !Array.isArray(manifest.content.artifacts)) return false;
+  return manifest.content.artifacts.some((entry) => isRecord(entry)
+    && entry.id === artifact.id
+    && entry.kind === artifact.kind
+    && entry.version === artifact.version);
+}
+
 export interface LockedPlayback {
   manifest: ArtifactRecord;
   timeline: ArtifactRecord;

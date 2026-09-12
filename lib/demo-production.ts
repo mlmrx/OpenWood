@@ -115,6 +115,25 @@ export const DEMO_ARTIFACTS: Array<{
     content: { targetSeconds: 90, estimatedSeconds: 92, beats: pilotBeats },
   },
   {
+    id: 'art_da_participation', kind: 'participation-manifest', title: 'Episode 1 Story Door', status: 'approved', version: 1, createdBy: 'audience-dramaturg',
+    content: {
+      schema: 'openwood.participation/v1',
+      prompts: [{
+        id: 'episode-01-door', episode: 1, trigger: { kind: 'time', atSeconds: 86 }, mode: 'prediction',
+        question: 'What should Mara risk next?',
+        context: 'The future broadcast named Elias, but the only proof lives inside the impossible signal.',
+        options: [
+          { id: 'trace-signal', label: 'Trace the impossible signal', dramaticCost: 'It may reveal Mara’s location to whoever is transmitting.' },
+          { id: 'find-elias', label: 'Find Elias first', dramaticCost: 'She must abandon the only evidence before it disappears.' },
+          { id: 'air-warning', label: 'Air the warning live', dramaticCost: 'Private terror becomes public panic across Port Cale.' },
+        ],
+        binding: 'advisory',
+        promise: 'The showrunner will address the audience’s chosen pressure in Episode 2.',
+        status: 'open',
+      }],
+    },
+  },
+  {
     id: 'art_da_script', kind: 'screenplay', title: 'Episode 1 screenplay', status: 'approved', version: 7, createdBy: 'screenwriter',
     content: {
       episode: '1.01 — 11:59', runtime: '01:32', revision: 'Gold pages · 2026-09-01',

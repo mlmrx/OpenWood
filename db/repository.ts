@@ -19,7 +19,16 @@ import type {
 import { makeId, slugify } from '@/lib/domain/types';
 import { HttpError } from '@/lib/http';
 import { evaluateGate } from '@/lib/domain/gates';
-import { isMasterEligible, lockedPlayback, validateReleaseManifest } from '@/lib/release';
+import {
+  ParticipationManifestError,
+  participationArtifactManifest,
+  percentageParts,
+  type AudiencePulse,
+  type ParticipationManifest,
+  type StoryDoor,
+} from '@/lib/domain/participation';
+import { isMasterEligible, lockedPlayback, releaseManifestPinsArtifact, validateReleaseManifest } from '@/lib/release';
+import { deriveAudienceViewerKey } from '@/lib/workspace';
 
 type ProjectRow = {
   id: string; workspace_id: string; title: string; slug: string; premise: string; logline: string; state: WorkflowState;
@@ -59,6 +68,23 @@ type ArtifactVersionRow = {
 };
 
 type RunEventRow = { id: number; run_id: string; type: string; payload_json: string; created_at: string };
+
+type AudienceSignalRow = {
+  id: string;
+  project_id: string;
+  manifest_artifact_id: string;
+  manifest_version: number;
+  prompt_id: string;
+  option_id: string;
+  viewer_key: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type StoryDoorStateRow = {
+  prompt_id: string;
+  status: StoryDoor['status'];
+};
 
 const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS system_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
@@ -113,6 +139,28 @@ const SCHEMA_STATEMENTS = [
     provenance_json TEXT NOT NULL, created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_assets_project_created ON assets(project_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS audience_signals (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    manifest_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    manifest_version INTEGER NOT NULL, prompt_id TEXT NOT NULL, option_id TEXT NOT NULL,
+    viewer_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_audience_signals_viewer_manifest_prompt ON audience_signals(manifest_artifact_id, manifest_version, prompt_id, viewer_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_audience_signals_manifest_prompt_option ON audience_signals(manifest_artifact_id, manifest_version, prompt_id, option_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_audience_signals_project_updated ON audience_signals(project_id, updated_at)`,
+  `CREATE TABLE IF NOT EXISTS audience_signal_rate_windows (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    window_started_at INTEGER NOT NULL, attempts INTEGER NOT NULL CHECK(attempts > 0), updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS story_door_states (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    manifest_artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    manifest_version INTEGER NOT NULL, prompt_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('open', 'closed')),
+    updated_by_workspace_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(manifest_artifact_id, manifest_version, prompt_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_story_door_states_project_manifest ON story_door_states(project_id, manifest_artifact_id, manifest_version)`,
 ] as const;
 
 let initialization: Promise<void> | null = null;
@@ -139,7 +187,7 @@ function assertArtifactContent(content: Record<string, unknown>): void {
 }
 
 async function seedDemo(db: D1Database): Promise<void> {
-  const fixtureVersion = '4';
+  const fixtureVersion = '5';
   const marker = await db.prepare("SELECT value FROM system_meta WHERE key = 'demo_fixture_version' LIMIT 1").first<{ value: string }>();
   if (marker?.value === fixtureVersion) return;
   const project = DEMO_PROJECT;
@@ -459,6 +507,262 @@ export async function createArtifactRevision(input: {
     version: 1, content: input.content, createdBy: input.createdBy, createdAt: now, updatedAt: now };
 }
 
+export interface ExpectedStageArtifact {
+  kind: ArtifactKind;
+  artifactId: string | null;
+  version: number | null;
+}
+
+export interface GeneratedStageArtifact {
+  kind: ArtifactKind;
+  title: string;
+  content: Record<string, unknown>;
+}
+
+export class StageCommitConflictError extends Error {
+  constructor() {
+    super('The production changed while the model was working. Its stale result was superseded; no generated artifacts or issues were applied.');
+    this.name = 'StageCommitConflictError';
+  }
+}
+
+async function stageCommitSnapshotMatches(input: {
+  db: D1Database;
+  workspaceId: string;
+  projectId: string;
+  runId: string;
+  agentId: string;
+  stage: string;
+  expectedState: WorkflowState;
+  expectedContentRevision: number;
+  expectedArtifacts: readonly ExpectedStageArtifact[];
+}): Promise<boolean> {
+  const project = await input.db.prepare('SELECT state, content_revision FROM projects WHERE id = ? AND workspace_id = ? LIMIT 1')
+    .bind(input.projectId, input.workspaceId).first<{ state: WorkflowState; content_revision: number }>();
+  if (!project || project.state !== input.expectedState || project.content_revision !== input.expectedContentRevision) return false;
+  const run = await input.db.prepare('SELECT agent_id, stage, status FROM agent_runs WHERE id = ? AND project_id = ? LIMIT 1')
+    .bind(input.runId, input.projectId).first<{ agent_id: string; stage: string; status: RunStatus }>();
+  if (!run || run.agent_id !== input.agentId || run.stage !== input.stage || run.status !== 'running') return false;
+  for (const expected of input.expectedArtifacts) {
+    const current = await input.db.prepare('SELECT id, current_version FROM artifacts WHERE project_id = ? AND kind = ? LIMIT 1')
+      .bind(input.projectId, expected.kind).first<{ id: string; current_version: number }>();
+    if (expected.artifactId === null) {
+      if (current) return false;
+    } else if (!current || current.id !== expected.artifactId || current.current_version !== expected.version) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function commitAgentStageResult(input: {
+  workspaceId: string;
+  projectId: string;
+  runId: string;
+  agentId: string;
+  stage: string;
+  expectedState: WorkflowState;
+  expectedContentRevision: number;
+  expectedArtifacts: readonly ExpectedStageArtifact[];
+  artifacts: readonly GeneratedStageArtifact[];
+  issues: readonly { severity: IssueRecord['severity']; title: string; evidence: string }[];
+  completionMessage: string;
+}): Promise<void> {
+  await ensureDatabase();
+  if (!Number.isInteger(input.expectedContentRevision) || input.expectedContentRevision < 0) {
+    throw new Error('The stage commit requires a valid source content revision.');
+  }
+  if (input.artifacts.length < 1 || input.artifacts.length > 8) {
+    throw new Error('A stage result must contain between one and eight artifacts.');
+  }
+  if (input.issues.length > 50) throw new Error('A stage result cannot report more than 50 issues.');
+  if (!input.completionMessage.trim() || input.completionMessage.length > 1000) {
+    throw new Error('The stage completion message must contain between 1 and 1000 characters.');
+  }
+
+  const outputKinds = new Set<ArtifactKind>();
+  const normalizedArtifacts = input.artifacts.map((artifact): GeneratedStageArtifact => {
+    if (outputKinds.has(artifact.kind)) throw new Error('A stage result cannot contain duplicate artifact kinds.');
+    outputKinds.add(artifact.kind);
+    const title = artifact.title.trim();
+    if (!title || title.length > 180) throw new Error('Generated artifact titles must contain between 1 and 180 characters.');
+    if (!artifact.content || typeof artifact.content !== 'object' || Array.isArray(artifact.content)) {
+      throw new Error('Generated artifact content must be a JSON object.');
+    }
+    assertArtifactContent(artifact.content);
+    return { ...artifact, title };
+  });
+
+  if (input.expectedArtifacts.length !== normalizedArtifacts.length) {
+    throw new Error('The stage result does not match its expected output artifact set.');
+  }
+  const expectedByKind = new Map<ArtifactKind, ExpectedStageArtifact>();
+  for (const expected of input.expectedArtifacts) {
+    if (expectedByKind.has(expected.kind)) throw new Error('The stage snapshot contains duplicate output artifact kinds.');
+    if ((expected.artifactId === null) !== (expected.version === null)) {
+      throw new Error('The stage snapshot must pair an existing artifact ID with its version.');
+    }
+    if (expected.version !== null && (!Number.isInteger(expected.version) || expected.version < 1)) {
+      throw new Error('The stage snapshot contains an invalid artifact version.');
+    }
+    expectedByKind.set(expected.kind, expected);
+  }
+  if ([...outputKinds].some((kind) => !expectedByKind.has(kind))
+    || [...expectedByKind].some(([kind]) => !outputKinds.has(kind))) {
+    throw new Error('The stage result contains an unexpected artifact kind.');
+  }
+
+  const normalizedIssues = input.issues.map((issue) => {
+    const title = issue.title.trim();
+    const evidence = issue.evidence.trim();
+    if (!['info', 'warning', 'blocker'].includes(issue.severity)) throw new Error('The stage result contains an invalid issue severity.');
+    if (!title || title.length > 180) throw new Error('Generated issue titles must contain between 1 and 180 characters.');
+    if (!evidence || evidence.length > 1000) throw new Error('Generated issue evidence must contain between 1 and 1000 characters.');
+    return { ...issue, title, evidence };
+  });
+
+  const now = new Date().toISOString();
+  const preparedIssues = normalizedIssues.map((issue) => ({ ...issue, id: makeId('iss') }));
+  const preparedArtifacts = await Promise.all(normalizedArtifacts.map(async (artifact) => {
+    const expected = expectedByKind.get(artifact.kind);
+    if (!expected) throw new Error('The stage result contains an unexpected artifact kind.');
+    const artifactId = expected.artifactId ?? makeId('art');
+    const version = (expected.version ?? 0) + 1;
+    const versionId = makeId('av');
+    const contentJson = JSON.stringify(artifact.content);
+    return {
+      ...artifact,
+      expected,
+      artifactId,
+      version,
+      versionId,
+      contentJson,
+      contentHash: await hashContent(contentJson),
+    };
+  }));
+
+  const guardKey = 'stage_commit_guard:' + input.runId + ':' + crypto.randomUUID();
+  const guardValue = input.projectId + ':' + String(input.expectedContentRevision);
+  const guardPredicates = [
+    'EXISTS (SELECT 1 FROM projects WHERE id = ? AND workspace_id = ? AND state = ? AND content_revision = ?)',
+    "EXISTS (SELECT 1 FROM agent_runs WHERE id = ? AND project_id = ? AND agent_id = ? AND stage = ? AND status = 'running')",
+  ];
+  const guardBindings: Array<string | number> = [
+    input.projectId,
+    input.workspaceId,
+    input.expectedState,
+    input.expectedContentRevision,
+    input.runId,
+    input.projectId,
+    input.agentId,
+    input.stage,
+  ];
+  for (const expected of input.expectedArtifacts) {
+    if (expected.artifactId === null) {
+      guardPredicates.push('NOT EXISTS (SELECT 1 FROM artifacts WHERE project_id = ? AND kind = ?)');
+      guardBindings.push(input.projectId, expected.kind);
+    } else {
+      guardPredicates.push('EXISTS (SELECT 1 FROM artifacts WHERE id = ? AND project_id = ? AND kind = ? AND current_version = ?)');
+      guardBindings.push(expected.artifactId, input.projectId, expected.kind, expected.version as number);
+    }
+  }
+
+  const db = database();
+  const guardSql = 'INSERT INTO system_meta (key, value) SELECT ?, CASE WHEN ('
+    + guardPredicates.join(' AND ')
+    + ') THEN ? ELSE NULL END';
+  const statements: D1PreparedStatement[] = [
+    // This is deliberately the first statement. A stale snapshot selects NULL,
+    // violates system_meta.value NOT NULL, and makes D1 roll back the whole batch.
+    db.prepare(guardSql).bind(guardKey, ...guardBindings, guardValue),
+  ];
+
+  for (const artifact of preparedArtifacts) {
+    if (artifact.expected.artifactId) {
+      statements.push(
+        db.prepare('INSERT INTO artifact_versions (id, artifact_id, version, schema_version, content_json, content_hash, created_by, created_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?)')
+          .bind(artifact.versionId, artifact.artifactId, artifact.version, artifact.contentJson, artifact.contentHash, input.agentId, now),
+        db.prepare("UPDATE artifacts SET title = ?, status = 'draft', current_version = ?, content_json = ?, created_by = ?, updated_at = ? WHERE id = ? AND project_id = ?")
+          .bind(artifact.title, artifact.version, artifact.contentJson, input.agentId, now, artifact.artifactId, input.projectId),
+      );
+    } else {
+      statements.push(
+        db.prepare("INSERT INTO artifacts (id, project_id, kind, title, status, current_version, content_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)")
+          .bind(artifact.artifactId, input.projectId, artifact.kind, artifact.title, artifact.contentJson, input.agentId, now, now),
+        db.prepare('INSERT INTO artifact_versions (id, artifact_id, version, schema_version, content_json, content_hash, created_by, created_at) VALUES (?, ?, 1, 1, ?, ?, ?, ?)')
+          .bind(artifact.versionId, artifact.artifactId, artifact.contentJson, artifact.contentHash, input.agentId, now),
+      );
+    }
+  }
+
+  for (const issue of preparedIssues) {
+    statements.push(
+      db.prepare("INSERT INTO issues (id, project_id, severity, category, title, evidence, status, owner_agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)")
+        .bind(issue.id, input.projectId, issue.severity, input.agentId, issue.title, issue.evidence, input.agentId, now),
+    );
+  }
+  statements.push(
+    db.prepare('UPDATE projects SET content_revision = content_revision + 1, updated_at = ? WHERE id = ? AND workspace_id = ?')
+      .bind(now, input.projectId, input.workspaceId),
+    db.prepare("UPDATE agent_runs SET status = 'completed', progress = 100, message = ?, error = NULL, updated_at = ? WHERE id = ? AND project_id = ?")
+      .bind(input.completionMessage, now, input.runId, input.projectId),
+    db.prepare("INSERT INTO run_events (run_id, type, payload_json, created_at) VALUES (?, 'completed', ?, ?)")
+      .bind(input.runId, JSON.stringify({
+        message: input.completionMessage,
+        artifactKinds: normalizedArtifacts.map((artifact) => artifact.kind),
+        issueCount: normalizedIssues.length,
+        sourceContentRevision: input.expectedContentRevision,
+      }), now),
+    db.prepare('DELETE FROM system_meta WHERE key = ? AND value = ?').bind(guardKey, guardValue),
+  );
+
+  try {
+    await db.batch(statements);
+  } catch (error) {
+    // A transport failure can make a successful commit look ambiguous to the
+    // caller. Exact generated IDs let us recognize that outcome safely.
+    try {
+      const committedRun = await db.prepare('SELECT status, message FROM agent_runs WHERE id = ? AND project_id = ? LIMIT 1')
+        .bind(input.runId, input.projectId).first<{ status: RunStatus; message: string }>();
+      const guard = await db.prepare('SELECT key FROM system_meta WHERE key = ? LIMIT 1').bind(guardKey).first<{ key: string }>();
+      let allVersionsExist = committedRun?.status === 'completed'
+        && committedRun.message === input.completionMessage
+        && !guard;
+      for (const artifact of preparedArtifacts) {
+        const version = await db.prepare('SELECT content_hash FROM artifact_versions WHERE id = ? AND artifact_id = ? AND version = ? LIMIT 1')
+          .bind(artifact.versionId, artifact.artifactId, artifact.version).first<{ content_hash: string }>();
+        if (version?.content_hash !== artifact.contentHash) allVersionsExist = false;
+      }
+      for (const issue of preparedIssues) {
+        const recorded = await db.prepare('SELECT id FROM issues WHERE id = ? AND project_id = ? LIMIT 1')
+          .bind(issue.id, input.projectId).first<{ id: string }>();
+        if (!recorded) allVersionsExist = false;
+      }
+      if (allVersionsExist) return;
+    } catch {
+      // Continue with snapshot diagnosis; otherwise preserve the original error.
+    }
+    let snapshotStillMatches: boolean | null = null;
+    try {
+      snapshotStillMatches = await stageCommitSnapshotMatches({
+        db,
+        workspaceId: input.workspaceId,
+        projectId: input.projectId,
+        runId: input.runId,
+        agentId: input.agentId,
+        stage: input.stage,
+        expectedState: input.expectedState,
+        expectedContentRevision: input.expectedContentRevision,
+        expectedArtifacts: input.expectedArtifacts,
+      });
+    } catch {
+      // Preserve the original database error if the diagnostic read also fails.
+    }
+    if (snapshotStillMatches === false) throw new StageCommitConflictError();
+    throw error;
+  }
+}
+
 export class RunBudgetError extends Error {
   constructor(message: string) { super(message); this.name = 'RunBudgetError'; }
 }
@@ -469,7 +773,9 @@ export async function createRun(workspaceId: string, projectId: string, agentId:
   const project = await db.prepare('SELECT id, state FROM projects WHERE id = ? AND workspace_id = ? LIMIT 1').bind(projectId, workspaceId).first<{ id: string; state: WorkflowState }>();
   if (!project) throw new Error('Production not found or is read-only.');
   if (['MASTERED', 'RELEASED'].includes(project.state)) throw new HttpError(409, 'The mastered release is immutable. Fork a new production revision to run another stage.');
-  const staleBefore = new Date(Date.now() - 2 * 60_000).toISOString();
+  // Provider requests may legitimately run for 180 seconds. Keep the lease
+  // beyond that maximum plus a two-minute scheduling/network margin.
+  const staleBefore = new Date(Date.now() - 5 * 60_000).toISOString();
   const stale = await db.prepare("SELECT id FROM agent_runs WHERE project_id = ? AND status = 'running' AND updated_at < ?").bind(projectId, staleBefore).all<{ id: string }>();
   if (stale.results.length > 0) {
     const expiredAt = new Date().toISOString();
@@ -686,6 +992,391 @@ export async function listAssets(projectId: string, workspaceId: string): Promis
   const rows = await database().prepare("SELECT a.* FROM assets a JOIN projects p ON p.id = a.project_id WHERE a.project_id = ? AND (p.workspace_id = ? OR p.workspace_id = 'public') ORDER BY a.created_at DESC")
     .bind(projectId, workspaceId).all<AssetRow>();
   return rows.results.map(mapAsset);
+}
+
+type ParticipationContext = {
+  bundle: ProjectBundle;
+  artifact: ArtifactRecord;
+  authoredManifest: ParticipationManifest;
+  manifest: ParticipationManifest;
+};
+
+export interface PublicParticipationManifest {
+  artifact: ArtifactRecord;
+  manifest: ParticipationManifest;
+}
+
+const AUDIENCE_SIGNAL_CHANGE_COOLDOWN_MS = 5_000;
+
+function audienceSignalsPerProjectMinute(): number {
+  const configured = Number((env as unknown as Record<string, unknown>).OPENWOOD_AUDIENCE_SIGNALS_PER_PROJECT_MINUTE);
+  if (!Number.isFinite(configured)) return 600;
+  return Math.min(10_000, Math.max(10, Math.floor(configured)));
+}
+
+function releasePinsParticipation(bundle: ProjectBundle, artifact: ArtifactRecord): boolean {
+  if (bundle.project.mode === 'demo') return true;
+  if (bundle.project.state !== 'RELEASED') return false;
+  return releaseManifestPinsArtifact(bundle, artifact);
+}
+
+async function participationContext(bundle: ProjectBundle, publicRead: boolean): Promise<ParticipationContext | null> {
+  if (publicRead && bundle.project.mode !== 'demo' && bundle.project.state !== 'RELEASED') return null;
+  const artifact = bundle.artifacts.find((candidate) => candidate.kind === 'participation-manifest');
+  try {
+    const authoredManifest = participationArtifactManifest(artifact, bundle.project);
+    if (!artifact || !authoredManifest || (publicRead && !releasePinsParticipation(bundle, artifact))) return null;
+    const rows = await database().prepare(`SELECT prompt_id, status FROM story_door_states
+      WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ?`)
+      .bind(bundle.project.id, artifact.id, artifact.version).all<StoryDoorStateRow>();
+    const statusByPrompt = new Map(rows.results.map((row) => [row.prompt_id, row.status]));
+    const manifest: ParticipationManifest = {
+      ...authoredManifest,
+      prompts: authoredManifest.prompts.map((prompt) => ({
+        ...prompt,
+        status: statusByPrompt.get(prompt.id) ?? prompt.status,
+      })),
+    };
+    return { bundle, artifact, authoredManifest, manifest };
+  } catch (error) {
+    if (error instanceof ParticipationManifestError) return null;
+    throw error;
+  }
+}
+
+async function buildAudiencePulse(
+  context: ParticipationContext,
+  prompt: StoryDoor,
+  viewerKey: string | null,
+  hideResultsUntilSelection: boolean,
+): Promise<AudiencePulse> {
+  const db = database();
+  const selectionPromise = viewerKey
+    ? db.prepare(`SELECT option_id FROM audience_signals
+      WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ? AND viewer_key = ? LIMIT 1`)
+      .bind(context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, viewerKey)
+      .first<Pick<AudienceSignalRow, 'option_id'>>()
+    : Promise.resolve(null);
+  const [countRows, selection] = await Promise.all([
+    db.prepare(`SELECT option_id, COUNT(*) AS signals FROM audience_signals
+      WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ?
+      GROUP BY option_id`)
+      .bind(context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id)
+      .all<{ option_id: string; signals: number }>(),
+    selectionPromise,
+  ]);
+  const countByOption = new Map(countRows.results.map((row) => [row.option_id, Number(row.signals)]));
+  const aggregateCounts = prompt.options.map((option) => countByOption.get(option.id) ?? 0);
+  const resultsVisible = !hideResultsUntilSelection || Boolean(selection?.option_id);
+  const visibleCounts = resultsVisible ? aggregateCounts : aggregateCounts.map(() => 0);
+  const percentages = resultsVisible ? percentageParts(aggregateCounts) : aggregateCounts.map(() => 0);
+  return {
+    schema: 'openwood.audience-pulse/v1',
+    project: { id: context.bundle.project.id, slug: context.bundle.project.slug, title: context.bundle.project.title },
+    manifest: { artifactId: context.artifact.id, version: context.artifact.version },
+    prompt: {
+      ...prompt,
+      options: prompt.options.map((option, index) => ({ ...option, signals: visibleCounts[index], percentage: percentages[index] })),
+    },
+    selectedOptionId: selection?.option_id ?? null,
+    totalSignals: resultsVisible ? aggregateCounts.reduce((sum, count) => sum + count, 0) : 0,
+  };
+}
+
+function selectStoryDoor(manifest: ParticipationManifest, promptId?: string, episode?: number): StoryDoor | undefined {
+  const candidates = episode === undefined
+    ? manifest.prompts
+    : manifest.prompts.filter((prompt) => prompt.episode === episode);
+  if (promptId) return candidates.find((prompt) => prompt.id === promptId);
+  return candidates.find((prompt) => prompt.status === 'open') ?? candidates[0];
+}
+
+export async function getPublicParticipationManifest(idOrSlug: string): Promise<PublicParticipationManifest | null> {
+  const bundle = await getPublicProjectBundle(idOrSlug);
+  if (!bundle) return null;
+  const context = await participationContext(bundle, true);
+  if (!context) return null;
+  return { artifact: context.artifact, manifest: context.manifest };
+}
+
+export async function getPublicAudiencePulse(
+  idOrSlug: string,
+  audienceToken: string,
+  promptId?: string,
+  episode?: number,
+): Promise<AudiencePulse | null> {
+  const bundle = await getPublicProjectBundle(idOrSlug);
+  if (!bundle) return null;
+  const context = await participationContext(bundle, true);
+  if (!context) return null;
+  const prompt = selectStoryDoor(context.manifest, promptId, episode);
+  const viewerKey = await deriveAudienceViewerKey(audienceToken, bundle.project.id, context.artifact.id, context.artifact.version);
+  return prompt ? buildAudiencePulse(context, prompt, viewerKey, true) : null;
+}
+
+export async function getOwnerAudiencePulses(projectId: string, workspaceId: string): Promise<AudiencePulse[] | null> {
+  await ensureDatabase();
+  const project = await database().prepare('SELECT * FROM projects WHERE id = ? AND workspace_id = ? LIMIT 1')
+    .bind(projectId, workspaceId).first<ProjectRow>();
+  if (!project) return null;
+  const bundle = await loadProjectBundle(project);
+  const context = await participationContext(bundle, false);
+  if (!context) return [];
+  return Promise.all(context.manifest.prompts.map((prompt) => buildAudiencePulse(context, prompt, null, false)));
+}
+
+function viewerCooldownError(retryAfterSeconds: number): HttpError {
+  return new HttpError(429, 'Wait a few seconds before changing this Story Door choice again.', {
+    code: 'story-door-change-cooldown',
+    retryAfterSeconds,
+  });
+}
+
+function projectAudienceRateError(retryAfterSeconds: number): HttpError {
+  return new HttpError(429, 'This storyworld reached its audience-change limit for the current 60-second window.', {
+    code: 'story-door-project-rate-limit',
+    retryAfterSeconds,
+  });
+}
+
+function cooldownRemaining(updatedAt: string, nowMs: number): number {
+  const updatedMs = Date.parse(updatedAt);
+  if (!Number.isFinite(updatedMs)) return Math.ceil(AUDIENCE_SIGNAL_CHANGE_COOLDOWN_MS / 1_000);
+  return Math.max(0, Math.ceil((updatedMs + AUDIENCE_SIGNAL_CHANGE_COOLDOWN_MS - nowMs) / 1_000));
+}
+
+function publicParticipationGuardSql(): string {
+  return `EXISTS (
+    SELECT 1 FROM projects p JOIN artifacts a ON a.project_id = p.id
+    WHERE p.id = ? AND a.id = ? AND a.kind = 'participation-manifest'
+      AND a.status IN ('approved', 'locked') AND a.current_version = ?
+      AND (
+        p.mode = 'demo' OR (
+          p.state = 'RELEASED' AND EXISTS (
+            SELECT 1 FROM artifacts release_artifact, json_each(release_artifact.content_json, '$.artifacts') pinned
+            WHERE release_artifact.project_id = p.id AND release_artifact.kind = 'release-manifest'
+              AND release_artifact.status = 'locked'
+              AND json_extract(pinned.value, '$.id') = ?
+              AND json_extract(pinned.value, '$.kind') = 'participation-manifest'
+              AND json_extract(pinned.value, '$.version') = ?
+          )
+        )
+      )
+  )`;
+}
+
+export async function castAudienceSignal(input: {
+  idOrSlug: string;
+  audienceToken: string;
+  promptId: string;
+  optionId: string;
+}): Promise<{ pulse: AudiencePulse; created: boolean }> {
+  await ensureDatabase();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.promptId) || input.promptId.length > 64) {
+    throw new HttpError(400, 'promptId must be a valid Story Door ID.');
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.optionId) || input.optionId.length > 64) {
+    throw new HttpError(400, 'optionId must be a valid Story Door option ID.');
+  }
+  const bundle = await getPublicProjectBundle(input.idOrSlug);
+  const context = bundle ? await participationContext(bundle, true) : null;
+  if (!context) throw new HttpError(404, 'This screening has no public Story Door.');
+  const prompt = context.manifest.prompts.find((candidate) => candidate.id === input.promptId);
+  const authoredPrompt = context.authoredManifest.prompts.find((candidate) => candidate.id === input.promptId);
+  if (!prompt) throw new HttpError(404, 'Story Door not found.');
+  if (prompt.status !== 'open') throw new HttpError(409, 'This Story Door is closed.');
+  if (!prompt.options.some((option) => option.id === input.optionId)) throw new HttpError(400, 'The selected option does not belong to this Story Door.');
+  if (!authoredPrompt) throw new HttpError(409, 'The Story Door manifest changed. Reload and retry.');
+
+  const db = database();
+  const viewerKey = await deriveAudienceViewerKey(input.audienceToken, context.bundle.project.id, context.artifact.id, context.artifact.version);
+  const existing = await db.prepare(`SELECT id, option_id, updated_at FROM audience_signals
+    WHERE manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ? AND viewer_key = ? LIMIT 1`)
+    .bind(context.artifact.id, context.artifact.version, prompt.id, viewerKey)
+    .first<Pick<AudienceSignalRow, 'id' | 'option_id' | 'updated_at'>>();
+  if (existing?.option_id === input.optionId) {
+    return { pulse: await buildAudiencePulse(context, prompt, viewerKey, true), created: false };
+  }
+  const nowMs = Date.now();
+  if (existing) {
+    const remaining = cooldownRemaining(existing.updated_at, nowMs);
+    if (remaining > 0) throw viewerCooldownError(remaining);
+  }
+  const now = new Date(nowMs).toISOString();
+  const expiredWindowStartedBefore = nowMs - 60_000;
+  const minuteLimit = audienceSignalsPerProjectMinute();
+  const guardKey = `audience_signal_guard:${crypto.randomUUID()}`;
+  const guardValue = `${context.artifact.id}:${context.artifact.version}:${prompt.id}`;
+  const expectedSignalPredicate = existing
+    ? `EXISTS (SELECT 1 FROM audience_signals WHERE id = ? AND project_id = ? AND manifest_artifact_id = ?
+        AND manifest_version = ? AND prompt_id = ? AND viewer_key = ? AND option_id = ? AND updated_at = ?)`
+    : `NOT EXISTS (SELECT 1 FROM audience_signals WHERE project_id = ? AND manifest_artifact_id = ?
+        AND manifest_version = ? AND prompt_id = ? AND viewer_key = ?)`;
+  const expectedSignalBindings: Array<string | number> = existing
+    ? [existing.id, context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, viewerKey, existing.option_id, existing.updated_at]
+    : [context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, viewerKey];
+  const guardSql = `INSERT INTO system_meta (key, value) SELECT ?, CASE WHEN (
+    ${publicParticipationGuardSql()}
+    AND COALESCE((SELECT status FROM story_door_states WHERE project_id = ? AND manifest_artifact_id = ?
+      AND manifest_version = ? AND prompt_id = ?), ?) = 'open'
+    AND (
+      NOT EXISTS (SELECT 1 FROM audience_signal_rate_windows WHERE project_id = ?)
+      OR (SELECT window_started_at FROM audience_signal_rate_windows WHERE project_id = ?) <= ?
+      OR (SELECT attempts FROM audience_signal_rate_windows WHERE project_id = ?) < ?
+    )
+    AND ${expectedSignalPredicate}
+  ) THEN ? ELSE NULL END`;
+  const statements: D1PreparedStatement[] = [
+    db.prepare(guardSql).bind(
+      guardKey,
+      context.bundle.project.id, context.artifact.id, context.artifact.version, context.artifact.id, context.artifact.version,
+      context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, authoredPrompt.status,
+      context.bundle.project.id, context.bundle.project.id, expiredWindowStartedBefore, context.bundle.project.id, minuteLimit,
+      ...expectedSignalBindings,
+      guardValue,
+    ),
+    db.prepare(`INSERT INTO audience_signal_rate_windows (project_id, window_started_at, attempts, updated_at)
+      VALUES (?, ?, 1, ?)
+      ON CONFLICT(project_id) DO UPDATE SET
+        window_started_at = CASE
+          WHEN audience_signal_rate_windows.window_started_at <= ? THEN excluded.window_started_at
+          ELSE audience_signal_rate_windows.window_started_at
+        END,
+        attempts = CASE
+          WHEN audience_signal_rate_windows.window_started_at <= ? THEN 1
+          ELSE audience_signal_rate_windows.attempts + 1
+        END,
+        updated_at = excluded.updated_at`)
+      .bind(context.bundle.project.id, nowMs, now, expiredWindowStartedBefore, expiredWindowStartedBefore),
+  ];
+  const signalId = existing?.id ?? makeId('sig');
+  if (existing) {
+    statements.push(db.prepare(`UPDATE audience_signals SET option_id = ?, updated_at = ?
+      WHERE id = ? AND project_id = ? AND manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ? AND viewer_key = ?`)
+      .bind(input.optionId, now, existing.id, context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, viewerKey));
+  } else {
+    statements.push(db.prepare(`INSERT INTO audience_signals (
+      id, project_id, manifest_artifact_id, manifest_version, prompt_id, option_id, viewer_key, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(signalId, context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, input.optionId, viewerKey, now, now));
+  }
+  statements.push(db.prepare('DELETE FROM system_meta WHERE key = ? AND value = ?').bind(guardKey, guardValue));
+
+  try {
+    await db.batch(statements);
+  } catch (error) {
+    try {
+      const freshBundle = await getPublicProjectBundle(input.idOrSlug);
+      const freshContext = freshBundle ? await participationContext(freshBundle, true) : null;
+      if (!freshContext) throw new HttpError(404, 'This screening has no public Story Door.');
+      const freshPrompt = freshContext.manifest.prompts.find((candidate) => candidate.id === input.promptId);
+      if (!freshPrompt) throw new HttpError(404, 'Story Door not found.');
+      if (freshPrompt.status !== 'open') throw new HttpError(409, 'This Story Door is closed.');
+      const persisted = await db.prepare(`SELECT option_id, updated_at FROM audience_signals
+        WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ? AND viewer_key = ? LIMIT 1`)
+        .bind(freshContext.bundle.project.id, freshContext.artifact.id, freshContext.artifact.version, freshPrompt.id, viewerKey)
+        .first<Pick<AudienceSignalRow, 'option_id' | 'updated_at'>>();
+      if (persisted?.option_id === input.optionId) {
+        return { pulse: await buildAudiencePulse(freshContext, freshPrompt, viewerKey, true), created: !existing };
+      }
+      if (persisted) {
+        const remaining = cooldownRemaining(persisted.updated_at, Date.now());
+        if (remaining > 0) throw viewerCooldownError(remaining);
+      }
+      const rate = await db.prepare('SELECT window_started_at, attempts FROM audience_signal_rate_windows WHERE project_id = ?')
+        .bind(freshContext.bundle.project.id).first<{ window_started_at: number; attempts: number }>();
+      if (rate && rate.window_started_at > Date.now() - 60_000 && Number(rate.attempts) >= minuteLimit) {
+        const retryAfter = Math.max(1, Math.ceil((rate.window_started_at + 60_000 - Date.now()) / 1_000));
+        throw projectAudienceRateError(retryAfter);
+      }
+      throw new HttpError(409, 'The Story Door changed while your signal was being recorded. Reload and retry.');
+    } catch (diagnosticError) {
+      if (diagnosticError instanceof HttpError) throw diagnosticError;
+    }
+    throw error;
+  }
+
+  const persisted = await db.prepare(`SELECT id FROM audience_signals
+    WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ?
+      AND prompt_id = ? AND option_id = ? AND viewer_key = ? LIMIT 1`)
+    .bind(context.bundle.project.id, context.artifact.id, context.artifact.version, prompt.id, input.optionId, viewerKey)
+    .first<{ id: string }>();
+  if (!persisted) throw new HttpError(409, 'The Story Door signal could not be verified. Reload and retry.');
+  return { pulse: await buildAudiencePulse(context, prompt, viewerKey, true), created: !existing };
+}
+
+export async function setStoryDoorStatus(input: {
+  projectId: string;
+  workspaceId: string;
+  promptId: string;
+  status: StoryDoor['status'];
+}): Promise<AudiencePulse> {
+  await ensureDatabase();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.promptId) || input.promptId.length > 64) {
+    throw new HttpError(400, 'promptId must be a valid Story Door ID.');
+  }
+  if (input.status !== 'open' && input.status !== 'closed') throw new HttpError(400, 'status must be open or closed.');
+  const db = database();
+  const project = await db.prepare('SELECT * FROM projects WHERE id = ? AND workspace_id = ? LIMIT 1')
+    .bind(input.projectId, input.workspaceId).first<ProjectRow>();
+  if (!project) throw new HttpError(404, 'Production not found.');
+  const bundle = await loadProjectBundle(project);
+  const context = await participationContext(bundle, false);
+  if (!context) throw new HttpError(409, 'This production has no approved Story Door manifest.');
+  if (bundle.project.state !== 'RELEASED' || !releasePinsParticipation(bundle, context.artifact)) {
+    throw new HttpError(409, 'Story Door operations require a released production pinned to this exact participation manifest.');
+  }
+  const prompt = context.manifest.prompts.find((candidate) => candidate.id === input.promptId);
+  if (!prompt) throw new HttpError(404, 'Story Door not found.');
+  if (prompt.status === input.status) return buildAudiencePulse(context, prompt, null, false);
+
+  const now = new Date().toISOString();
+  const guardKey = `story_door_state_guard:${crypto.randomUUID()}`;
+  const guardValue = `${context.artifact.id}:${context.artifact.version}:${prompt.id}:${input.status}`;
+  const guardSql = `INSERT INTO system_meta (key, value) SELECT ?, CASE WHEN (
+    EXISTS (
+      SELECT 1 FROM projects p JOIN artifacts a ON a.project_id = p.id
+      WHERE p.id = ? AND p.workspace_id = ? AND p.state = 'RELEASED'
+        AND a.id = ? AND a.kind = 'participation-manifest' AND a.status IN ('approved', 'locked') AND a.current_version = ?
+        AND EXISTS (
+          SELECT 1 FROM artifacts release_artifact, json_each(release_artifact.content_json, '$.artifacts') pinned
+          WHERE release_artifact.project_id = p.id AND release_artifact.kind = 'release-manifest'
+            AND release_artifact.status = 'locked'
+            AND json_extract(pinned.value, '$.id') = ?
+            AND json_extract(pinned.value, '$.kind') = 'participation-manifest'
+            AND json_extract(pinned.value, '$.version') = ?
+        )
+    )
+  ) THEN ? ELSE NULL END`;
+  try {
+    await db.batch([
+      db.prepare(guardSql).bind(
+        guardKey, input.projectId, input.workspaceId, context.artifact.id, context.artifact.version,
+        context.artifact.id, context.artifact.version, guardValue,
+      ),
+      db.prepare(`INSERT INTO story_door_states (
+        project_id, manifest_artifact_id, manifest_version, prompt_id, status, updated_by_workspace_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(manifest_artifact_id, manifest_version, prompt_id) DO UPDATE SET
+        status = excluded.status, updated_by_workspace_id = excluded.updated_by_workspace_id, updated_at = excluded.updated_at`)
+        .bind(input.projectId, context.artifact.id, context.artifact.version, prompt.id, input.status, input.workspaceId, now),
+      db.prepare('DELETE FROM system_meta WHERE key = ? AND value = ?').bind(guardKey, guardValue),
+    ]);
+  } catch (error) {
+    const current = await db.prepare(`SELECT status FROM story_door_states
+      WHERE project_id = ? AND manifest_artifact_id = ? AND manifest_version = ? AND prompt_id = ? LIMIT 1`)
+      .bind(input.projectId, context.artifact.id, context.artifact.version, prompt.id).first<{ status: StoryDoor['status'] }>()
+      .catch(() => null);
+    if (current?.status !== input.status) throw error;
+  }
+
+  const freshBundle = await getProjectBundle(input.projectId, input.workspaceId);
+  const freshContext = freshBundle ? await participationContext(freshBundle, false) : null;
+  const freshPrompt = freshContext?.manifest.prompts.find((candidate) => candidate.id === input.promptId);
+  if (!freshContext || !freshPrompt || freshPrompt.status !== input.status) {
+    throw new HttpError(409, 'The released Story Door changed while its operational state was being updated. Reload and retry.');
+  }
+  return buildAudiencePulse(freshContext, freshPrompt, null, false);
 }
 
 export async function masterProject(projectId: string, workspaceId: string): Promise<ArtifactRecord> {

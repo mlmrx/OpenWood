@@ -10,6 +10,7 @@ export const metadata: Metadata = {
 
 export default function ProviderSettingsPage() {
   const provider = getProviderStatus();
+  const activeRoutes = provider.routes.filter((route) => route.configured);
   return (
     <main className="settings-page">
       <header><Link href="/"><ArrowLeft /> Back to studio</Link><div className="brand-lockup"><span className="brand-mark" aria-hidden="true"><span /><span /></span><span>OPENWOOD</span></div><span>Settings</span></header>
@@ -18,17 +19,17 @@ export default function ProviderSettingsPage() {
         <section className="settings-content">
           <p className="kicker">Server-side configuration</p>
           <h1>Bring the model.<br />Keep the studio open.</h1>
-          <p className="settings-lede">OpenWood runs without an account or API key in manual mode. Connect any OpenAI-compatible endpoint—local Ollama, vLLM, a private gateway, or a hosted provider—to activate the creative departments.</p>
+          <p className="settings-lede">OpenWood runs without an account or API key in manual mode. Its model fabric can give the writers room, production planners, and independent critics different OpenAI-compatible routes while retaining one legacy fallback.</p>
 
           <article className={`provider-status-card ${provider.configured ? 'connected' : ''}`}>
             <div>{provider.configured ? <BadgeCheck /> : <CircleOff />}</div>
-            <span><small>Current state</small><strong>{provider.configured ? 'Provider connected' : 'Manual studio mode'}</strong><p>{provider.configured ? `${provider.model} is available through the private server adapter. Endpoint topology and credentials are never exposed here.` : 'Demo playback, artifact editing, uploads, review, versioning, and export work now. Creative generation is intentionally disabled until a provider is configured.'}</p></span>
+            <span><small>Current state</small><strong>{provider.configured ? `${activeRoutes.length} craft route${activeRoutes.length === 1 ? '' : 's'} ready` : 'Manual studio mode'}</strong><p>{provider.configured ? activeRoutes.map((route) => `${route.title}: ${route.model} · ${route.dataBoundary}`).join('  /  ') : 'Demo playback, artifact editing, uploads, review, versioning, and export work now. Creative generation is intentionally disabled until a provider is configured.'}</p></span>
           </article>
 
           <div className="settings-grid">
-            <article><TerminalSquare /><h2>1. Configure the endpoint</h2><p>Add these values to your server environment. Never expose them through variables prefixed with <code>NEXT_PUBLIC_</code>.</p><pre><code>OPENWOOD_LLM_BASE_URL=http://localhost:11434/v1{`\n`}OPENWOOD_LLM_MODEL=qwen3:30b{`\n`}OPENWOOD_LLM_API_KEY=optional</code></pre></article>
-            <article><ShieldCheck /><h2>2. Keep credentials behind the API</h2><p>The browser talks only to OpenWood route handlers. Provider credentials stay in the Worker or Node environment and are never included in production packages.</p><ul><li>Use a private gateway in teams.</li><li>Apply model and spending limits upstream.</li><li>Rotate provider credentials independently.</li></ul></article>
-            <article><KeyRound /><h2>3. Verify the contract</h2><p>Restart the server, then check the health endpoint. A connected provider reports its model and endpoint without returning a secret.</p><Link href="/api/health">Open system health <ExternalLink /></Link></article>
+            <article><TerminalSquare /><h2>1. Run story locally</h2><p>FreeToken is a strong local text route. Prompt-enforced JSON is the conservative default; no media capability is implied.</p><pre><code>OPENWOOD_STORY_LLM_PROVIDER=freetoken{`\n`}OPENWOOD_STORY_LLM_BASE_URL=http://127.0.0.1:1919/v1{`\n`}OPENWOOD_STORY_LLM_MODEL=your-pinned-model</code></pre></article>
+            <article><ShieldCheck /><h2>2. Separate taste from judgment</h2><p>Give each lane an independently selected model, or leave it unset to use <code>OPENWOOD_LLM_*</code>.</p><ul>{provider.routes.map((route) => <li key={route.lane}>{route.title}: {route.configured ? `${route.provider} / ${route.model}` : 'manual or legacy route required'}</li>)}</ul><p>Credentials stay in server environment variables and never enter this page or a production export.</p></article>
+            <article><KeyRound /><h2>3. Verify the contract</h2><p>The provider endpoint reports model identities, privacy boundary, JSON strategy, and bounded output limits without returning URLs or secrets. Pin model revisions before production use.</p><Link href="/api/provider">Inspect model fabric <ExternalLink /></Link><Link href="/api/health">Open system health <ExternalLink /></Link></article>
           </div>
         </section>
       </div>

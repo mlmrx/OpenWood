@@ -1,11 +1,11 @@
 import { STAGE_AGENT, getAgent } from '@/lib/agents/catalog';
 import {
-  createArtifactRevision,
+  commitAgentStageResult,
   createRun,
   finishRun,
   getProjectBundle,
-  recordIssues,
   RunBudgetError,
+  StageCommitConflictError,
 } from '@/db/repository';
 import type { ArtifactKind, ProjectBundle, WorkflowState } from '@/lib/domain/types';
 import { evaluateGate } from '@/lib/domain/gates';
@@ -19,6 +19,11 @@ export const STAGE_PLAN: Readonly<Record<string, {
   brief: { artifactKinds: ['greenlight-memo'], allowedStates: ['BRIEF_READY'], inputKinds: ['creative-brief'] },
   bible: { artifactKinds: ['story-bible', 'character-canon'], allowedStates: ['GREENLIT'], inputKinds: ['creative-brief', 'greenlight-memo'] },
   outline: { artifactKinds: ['episode-beats'], allowedStates: ['BIBLE_LOCKED'], inputKinds: ['story-bible', 'character-canon'] },
+  participation: {
+    artifactKinds: ['participation-manifest'],
+    allowedStates: ['OUTLINE_LOCKED', 'SCRIPT_DRAFT', 'SCRIPT_LOCKED', 'PREPRO_LOCKED', 'PRODUCING', 'ASSETS_READY', 'ROUGH_CUT', 'FINAL_QC', 'PICTURE_LOCKED'],
+    inputKinds: ['story-bible', 'character-canon', 'episode-beats'],
+  },
   script: { artifactKinds: ['screenplay'], allowedStates: ['OUTLINE_LOCKED'], inputKinds: ['episode-beats', 'story-bible', 'character-canon'] },
   coverage: { artifactKinds: ['coverage-report'], allowedStates: ['SCRIPT_DRAFT'], inputKinds: ['screenplay', 'story-bible'] },
   direction: { artifactKinds: ['director-treatment'], allowedStates: ['SCRIPT_LOCKED'], inputKinds: ['screenplay', 'story-bible'] },
@@ -74,23 +79,43 @@ export async function runStage(input: { workspaceId: string; projectId: string; 
   if (run.status === 'failed' || run.status === 'cancelled') throw new StageRunError('This idempotent attempt is closed. Retry with a new idempotency key.', 409, run.id);
   try {
     const result = await runStructuredAgent({ agent, project: bundle.project, stage: input.stage, artifacts: inputs.filter((artifact) => artifact !== undefined), outputKinds: plan.artifactKinds });
-    for (const artifact of result.artifacts) {
-      await createArtifactRevision({
-        workspaceId: input.workspaceId, projectId: bundle.project.id, kind: artifact.kind, title: artifact.title,
-        status: 'draft', content: { summary: result.summary, ...artifact.content }, createdBy: agent.id,
-      });
-    }
-    await recordIssues(bundle.project.id, input.workspaceId, agent.id, result.issues);
-    await finishRun(run.id, 'completed', `${agent.name} completed ${result.artifacts.map((artifact) => artifact.title).join(' and ')}. Human approval is required.`, null);
-    const updated = await getProjectBundle(bundle.project.id, input.workspaceId);
-    if (!updated) throw new Error('Production disappeared after stage completion.');
-    return { runId: run.id, bundle: updated };
+    await commitAgentStageResult({
+      workspaceId: input.workspaceId,
+      projectId: bundle.project.id,
+      runId: run.id,
+      agentId: agent.id,
+      stage: input.stage,
+      expectedState: bundle.project.state,
+      expectedContentRevision: bundle.project.contentRevision,
+      expectedArtifacts: plan.artifactKinds.map((kind) => {
+        const current = bundle.artifacts.find((artifact) => artifact.kind === kind);
+        return { kind, artifactId: current?.id ?? null, version: current?.version ?? null };
+      }),
+      artifacts: result.artifacts.map((artifact) => ({
+        kind: artifact.kind,
+        title: artifact.title,
+        content: { summary: result.summary, ...artifact.content },
+      })),
+      issues: result.issues,
+      completionMessage: `${agent.name} completed ${result.artifacts.map((artifact) => artifact.title).join(' and ')}. Human approval is required.`,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown agent failure.';
-    await finishRun(run.id, 'failed', `${agent.name} could not complete the ${input.stage} stage.`, message);
-    const status = error instanceof ProviderNotConfiguredError ? 503 : 502;
+    const superseded = error instanceof StageCommitConflictError;
+    await finishRun(
+      run.id,
+      'failed',
+      superseded
+        ? `${agent.name}'s ${input.stage} result was superseded by a newer production revision. No generated work was applied.`
+        : `${agent.name} could not complete the ${input.stage} stage.`,
+      message,
+    );
+    const status = superseded ? 409 : error instanceof ProviderNotConfiguredError ? 503 : 502;
     throw new StageRunError(message, status, run.id);
   }
+  const updated = await getProjectBundle(bundle.project.id, input.workspaceId);
+  if (!updated) throw new StageRunError('Production completed but could not be reloaded.', 500, run.id);
+  return { runId: run.id, bundle: updated };
 }
 
 export { evaluateGate };

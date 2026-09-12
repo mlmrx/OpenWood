@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 export const systemMeta = sqliteTable('system_meta', {
   key: text('key').primaryKey(),
@@ -146,4 +146,55 @@ export const assets = sqliteTable(
     createdAt: text('created_at').notNull(),
   },
   (table) => [index('idx_assets_project_created').on(table.projectId, table.createdAt)],
+);
+
+export const audienceSignals = sqliteTable(
+  'audience_signals',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+    manifestArtifactId: text('manifest_artifact_id').notNull().references(() => artifacts.id, { onDelete: 'cascade' }),
+    manifestVersion: integer('manifest_version').notNull(),
+    promptId: text('prompt_id').notNull(),
+    optionId: text('option_id').notNull(),
+    viewerKey: text('viewer_key').notNull(),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('idx_audience_signals_viewer_manifest_prompt').on(table.manifestArtifactId, table.manifestVersion, table.promptId, table.viewerKey),
+    index('idx_audience_signals_manifest_prompt_option').on(table.manifestArtifactId, table.manifestVersion, table.promptId, table.optionId),
+    index('idx_audience_signals_project_updated').on(table.projectId, table.updatedAt),
+  ],
+);
+
+export const audienceSignalRateWindows = sqliteTable(
+  'audience_signal_rate_windows',
+  {
+    projectId: text('project_id').primaryKey().references(() => projects.id, { onDelete: 'cascade' }),
+    windowStartedAt: integer('window_started_at').notNull(),
+    attempts: integer('attempts').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    check('audience_signal_rate_windows_attempts_check', sql`${table.attempts} > 0`),
+  ],
+);
+
+export const storyDoorStates = sqliteTable(
+  'story_door_states',
+  {
+    projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+    manifestArtifactId: text('manifest_artifact_id').notNull().references(() => artifacts.id, { onDelete: 'cascade' }),
+    manifestVersion: integer('manifest_version').notNull(),
+    promptId: text('prompt_id').notNull(),
+    status: text('status').notNull(),
+    updatedByWorkspaceId: text('updated_by_workspace_id').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.manifestArtifactId, table.manifestVersion, table.promptId] }),
+    index('idx_story_door_states_project_manifest').on(table.projectId, table.manifestArtifactId, table.manifestVersion),
+    check('story_door_states_status_check', sql`${table.status} in ('open', 'closed')`),
+  ],
 );

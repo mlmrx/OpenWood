@@ -31,6 +31,7 @@ const stages = [
 const agents = [
   { initials: 'EP', name: 'Sera', role: 'Executive producer', color: '#d7a15a' },
   { initials: 'SR', name: 'Marlowe', role: 'Showrunner', color: '#8c6f59' },
+  { initials: 'CR', name: 'Cass', role: 'Audience dramaturg', color: '#be6f52' },
   { initials: 'DP', name: 'Luca', role: 'Cinematographer', color: '#62768f' },
   { initials: 'ED', name: 'June', role: 'Picture editor', color: '#6f7f64' },
 ];
@@ -231,7 +232,7 @@ export default function Home() {
           <article className="ensemble-card">
             <div className="section-heading compact">
               <div><p className="kicker">Resident company</p><h2>Your creative ensemble</h2></div>
-              <span className="count-mark">14 agents</span>
+              <span className="count-mark">15 agents</span>
             </div>
             <div className="agent-list">
               {agents.map((agent) => (
@@ -252,7 +253,7 @@ export default function Home() {
               <span className="timecode">00:47 / 01:32</span>
             </div>
             <div className="screening-notes">
-              <p><MessageSquareText /> Browser-local frame notes</p><p>Independent rough-cut score <strong>84</strong></p>
+              <p><MessageSquareText /> Story Door · shape Episode 2</p><p>Independent rough-cut score <strong>84</strong></p>
             </div>
           </article>
 

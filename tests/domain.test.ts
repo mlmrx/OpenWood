@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT_CATALOG } from '../lib/agents/catalog';
 import { evaluateGate } from '../lib/domain/gates';
+import { parseParticipationManifest, percentageParts, ParticipationManifestError } from '../lib/domain/participation';
 import { slugify, type ArtifactRecord, type ProjectBundle, type WorkflowState } from '../lib/domain/types';
+import { deriveAudienceViewerKey } from '../lib/workspace';
 
 function artifact(kind: ArtifactRecord['kind'], content: Record<string, unknown> = { summary: 'A substantive, reviewed production artifact.' }, status: ArtifactRecord['status'] = 'approved'): ArtifactRecord {
   return { id: `art_${kind}`, projectId: 'test', kind, title: kind, status, version: 1, content, createdBy: kind === 'quality-report' ? 'final-critic' : 'test', createdAt: '', updatedAt: '' };
@@ -24,8 +26,17 @@ void test('slugify creates stable, URL-safe production slugs', () => {
   assert.equal(slugify('Café de l’orage'), 'cafe-de-l-orage');
 });
 
+void test('audience viewer keys are stable only inside one exact storyworld version', async () => {
+  const token = 'ab'.repeat(24);
+  const first = await deriveAudienceViewerKey(token, 'project-a', 'manifest-a', 1);
+  assert.equal(first, await deriveAudienceViewerKey(token, 'project-a', 'manifest-a', 1));
+  assert.notEqual(first, await deriveAudienceViewerKey(token, 'project-b', 'manifest-a', 1));
+  assert.notEqual(first, await deriveAudienceViewerKey(token, 'project-a', 'manifest-a', 2));
+  assert.match(first, /^[a-f0-9]{64}$/);
+});
+
 void test('the resident company has unique, bounded, tool-gated specialists', () => {
-  assert.equal(AGENT_CATALOG.length, 14);
+  assert.equal(AGENT_CATALOG.length, 15);
   assert.equal(new Set(AGENT_CATALOG.map((agent) => agent.id)).size, AGENT_CATALOG.length);
   for (const agent of AGENT_CATALOG) {
     assert.ok(agent.skills.length >= 4, `${agent.id} needs concrete skills`);
@@ -33,6 +44,40 @@ void test('the resident company has unique, bounded, tool-gated specialists', ()
     assert.ok(agent.gate.length >= 30, `${agent.id} needs an objective quality gate`);
     assert.ok(agent.persona.length >= 45, `${agent.id} needs a specific persona`);
   }
+});
+
+void test('Story Doors require authored choices with explicit dramatic cost', () => {
+  const manifest = parseParticipationManifest({
+    schema: 'openwood.participation/v1',
+    prompts: [{
+      id: 'episode-01-door', episode: 1, trigger: { kind: 'time', atSeconds: 86 }, mode: 'prediction',
+      question: 'What should Mara risk next?', context: 'Only the impossible signal can prove the warning came from tomorrow.',
+      options: [
+        { id: 'trace-signal', label: 'Trace the signal', dramaticCost: 'The transmitter may learn exactly where Mara is.' },
+        { id: 'find-elias', label: 'Find Elias first', dramaticCost: 'The only physical evidence may disappear forever.' },
+      ],
+      binding: 'advisory', promise: 'The showrunner will address the winning pressure in Episode 2.', status: 'open',
+    }],
+  }, { episodeCount: 8, targetDurationSec: 90 });
+  assert.equal(manifest.prompts[0].options.length, 2);
+  assert.equal(manifest.prompts[0].binding, 'advisory');
+
+  assert.throws(() => parseParticipationManifest({
+    schema: 'openwood.participation/v1',
+    prompts: [{
+      id: 'episode-01-door', episode: 9, trigger: { kind: 'time', atSeconds: 86 }, mode: 'prediction',
+      question: 'What should Mara risk next?', context: 'Only the impossible signal can prove the warning came from tomorrow.',
+      options: [{ id: 'trace-signal', label: 'Trace the signal', dramaticCost: '' }],
+      binding: 'binding', promise: 'The next episode will react to this choice.', status: 'open',
+    }],
+  }, { episodeCount: 8, targetDurationSec: 90 }), ParticipationManifestError);
+});
+
+void test('audience pulse percentages are deterministic and sum to one hundred', () => {
+  const percentages = percentageParts([1, 1, 1]);
+  assert.deepEqual(percentages, [34, 33, 33]);
+  assert.equal(percentages.reduce((sum, value) => sum + value, 0), 100);
+  assert.deepEqual(percentageParts([0, 0]), [0, 0]);
 });
 
 void test('script lock requires both authored screenplay and independent coverage', () => {

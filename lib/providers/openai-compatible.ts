@@ -1,9 +1,20 @@
 import { env } from 'cloudflare:workers';
 import type { AgentProfile, ArtifactKind, ArtifactRecord, ProjectRecord } from '@/lib/domain/types';
+import { parseParticipationManifest } from '@/lib/domain/participation';
+import {
+  buildStructuredChatBody,
+  inspectModelFabric,
+  modelLaneForStage,
+  resolveModelRouteForStage,
+  type ModelEnvironment,
+  type ModelLane,
+  type ModelProviderKind,
+  type PublicModelRoute,
+} from '@/lib/providers/model-fabric';
 
 export class ProviderNotConfiguredError extends Error {
   constructor() {
-    super('No model provider is configured. Set OPENWOOD_LLM_BASE_URL and OPENWOOD_LLM_MODEL on the server to run creative agents. Manual authoring, demo playback, review, and export remain available.');
+    super('No model route is configured for this production stage. Configure its story, planning, or critic route, or set the legacy OPENWOOD_LLM_BASE_URL and OPENWOOD_LLM_MODEL fallback. Manual authoring, demo playback, review, and export remain available.');
     this.name = 'ProviderNotConfiguredError';
   }
 }
@@ -14,6 +25,10 @@ export interface ProviderStatus {
   model: string | null;
   baseUrl: string | null;
   hasCredential: boolean;
+  lane: ModelLane | null;
+  provider: ModelProviderKind | null;
+  routes: readonly PublicModelRoute[];
+  diagnostics: readonly string[];
 }
 
 export interface StructuredAgentResult {
@@ -32,6 +47,7 @@ const ARTIFACT_CONTRACTS: Record<ArtifactKind, string> = {
   'story-bible': 'theme, engine, worldRules (array), seasonArc, motifs (array), toneBoundaries (array)',
   'character-canon': 'characters (array with name, desire, need, flaw, voice, look, knowledge)',
   'episode-beats': 'targetSeconds, estimatedSeconds, beats (array with at, duration, label, action, causalChange, cliffhanger)',
+  'participation-manifest': 'schema exactly openwood.participation/v1; prompts (1-12), each with unique id, valid episode, trigger {kind: time|end, atSeconds within runtime}, mode prediction|preference, question, context, 2-4 unique options each containing id, label, and explicit dramaticCost, binding exactly advisory, promise, status open|closed',
   'screenplay': 'episode, runtime, revision, scenes (array with slugline, action, dialogue array)',
   'coverage-report': 'verdict, logicAudit, runtimeAudit, dialogueAudit, setupPayoffAudit, blockers (array), recommendations (array)',
   'director-treatment': 'emotionalThesis, sceneObjectives, blocking, performanceBeats, coverageStrategy, transitions',
@@ -47,20 +63,25 @@ const ARTIFACT_CONTRACTS: Record<ArtifactKind, string> = {
   'release-manifest': 'reserved for the deterministic mastering command',
 };
 
-function runtimeEnv(): Cloudflare.Env {
-  return env as Cloudflare.Env;
+function runtimeEnv(): Cloudflare.Env & ModelEnvironment {
+  return env as Cloudflare.Env & ModelEnvironment;
 }
 
-export function getProviderStatus(): ProviderStatus {
-  const values = runtimeEnv();
-  const baseUrl = values.OPENWOOD_LLM_BASE_URL?.trim() || null;
-  const model = values.OPENWOOD_LLM_MODEL?.trim() || null;
+export function getProviderStatus(values: ModelEnvironment = runtimeEnv()): ProviderStatus {
+  const fabric = inspectModelFabric(values);
+  const primary = resolveModelRouteForStage(values, 'script')
+    ?? resolveModelRouteForStage(values, 'brief')
+    ?? resolveModelRouteForStage(values, 'qc');
   return {
-    configured: Boolean(baseUrl && model),
+    configured: fabric.configured,
     type: 'openai-compatible',
-    model,
-    baseUrl: baseUrl ? baseUrl.replace(/\/+$|\/+$/g, '') : null,
-    hasCredential: Boolean(values.OPENWOOD_LLM_API_KEY?.trim()),
+    model: primary?.model ?? null,
+    baseUrl: primary?.baseUrl ?? null,
+    hasCredential: primary?.hasCredential ?? false,
+    lane: primary?.lane ?? null,
+    provider: primary?.provider ?? null,
+    routes: fabric.routes,
+    diagnostics: fabric.diagnostics,
   };
 }
 
@@ -105,10 +126,10 @@ export async function runStructuredAgent(input: {
   artifacts: ArtifactRecord[];
   outputKinds: readonly ArtifactKind[];
 }): Promise<StructuredAgentResult> {
-  const status = getProviderStatus();
-  if (!status.configured || !status.baseUrl || !status.model) throw new ProviderNotConfiguredError();
   const values = runtimeEnv();
-  const endpoint = `${status.baseUrl}/chat/completions`;
+  const route = resolveModelRouteForStage(values, input.stage);
+  if (!route) throw new ProviderNotConfiguredError();
+  const endpoint = `${route.baseUrl}/chat/completions`;
   const sourcePackage = input.artifacts.map((artifact) => ({
     kind: artifact.kind, title: artifact.title, version: artifact.version, status: artifact.status, content: artifact.content,
   }));
@@ -132,19 +153,26 @@ export async function runStructuredAgent(input: {
     approvedArtifacts: sourcePackage,
   });
   const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (values.OPENWOOD_LLM_API_KEY?.trim()) headers.authorization = `Bearer ${values.OPENWOOD_LLM_API_KEY.trim()}`;
+  if (route.apiKey) headers.authorization = `Bearer ${route.apiKey}`;
+  const requestBody = buildStructuredChatBody(route, {
+    system,
+    user,
+    temperature: input.stage === 'qc' || input.stage === 'rights' || input.stage === 'continuity' ? 0.2 : 0.65,
+  });
   const response = await fetch(endpoint, {
-    method: 'POST', headers, signal: AbortSignal.timeout(90_000),
-    body: JSON.stringify({
-      model: status.model,
-      temperature: input.stage === 'qc' || input.stage === 'rights' || input.stage === 'continuity' ? 0.2 : 0.65,
-      response_format: { type: 'json_object' },
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-    }),
+    method: 'POST', headers, signal: AbortSignal.timeout(route.timeoutMs), body: JSON.stringify(requestBody),
   });
   if (!response.ok) {
     const requestId = response.headers.get('x-request-id');
-    throw new Error(`Model provider failed with HTTP ${response.status}${requestId ? ` (request ${requestId})` : ''}.`);
+    throw new Error(`${modelLaneForStage(input.stage)} model route failed with HTTP ${response.status}${requestId ? ` (request ${requestId})` : ''}.`);
   }
-  return parseJson(extractText(await response.json() as ChatResponse), input.outputKinds);
+  const result = parseJson(extractText(await response.json() as ChatResponse), input.outputKinds);
+  return {
+    ...result,
+    artifacts: result.artifacts.map((artifact) => {
+      if (artifact.kind !== 'participation-manifest') return artifact;
+      const manifest = parseParticipationManifest(artifact.content, input.project);
+      return { ...artifact, content: { schema: manifest.schema, prompts: manifest.prompts } };
+    }),
+  };
 }

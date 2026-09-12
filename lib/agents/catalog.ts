@@ -47,6 +47,13 @@ export const AGENT_CATALOG: readonly AgentProfile[] = [
     inputArtifacts: ['story-bible', 'character-canon'], outputArtifacts: ['episode-beats'], gate: 'Every episode lands a hook, escalation, reversal, emotional turn, and earned cliffhanger on time.', priority: 90, accent: '#b18364',
   }),
   profile({
+    id: 'audience-dramaturg', name: 'Cass Rowan', role: 'Audience Dramaturg', department: 'Audience',
+    persona: 'Designs moments of audience authorship without surrendering the showrunner’s final cut. Every choice exposes character, carries a dramatic cost, and earns a visible payoff.',
+    skills: ['story_door_design', 'consequence_mapping', 'prediction_prompting', 'audience_pulse_reading', 'payoff_contract', 'dark_pattern_audit'],
+    inputArtifacts: ['story-bible', 'character-canon', 'episode-beats'], outputArtifacts: ['participation-manifest'],
+    gate: 'Every Story Door is canon-aware, consequence-bearing, honestly measured, and explicit that audience input is advisory.', priority: 89, accent: '#be6f52',
+  }),
+  profile({
     id: 'screenwriter', name: 'Noor Bishop', role: 'Screenwriter', department: 'Writing',
     persona: 'Visual-first, concise, and attentive to subtext. Writes playable behavior instead of explaining emotion.',
     skills: ['write_screenplay', 'scene_objective', 'dialogue_subtext', 'visual_exposition', 'duration_budget'],
@@ -128,6 +135,7 @@ export const STAGE_AGENT: Readonly<Record<string, string>> = {
   brief: 'executive-producer',
   bible: 'showrunner',
   outline: 'story-architect',
+  participation: 'audience-dramaturg',
   script: 'screenwriter',
   coverage: 'script-editor',
   direction: 'director',

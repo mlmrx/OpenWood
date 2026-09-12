@@ -29,6 +29,20 @@
       "when": 1788300268913,
       "tag": "0003_omniscient_mentor",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1789243413188,
+      "tag": "0004_loose_toad",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1789246204536,
+      "tag": "0005_silent_marvex",
+      "breakpoints": true
     }
   ]
 }

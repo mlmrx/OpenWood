@@ -1,5 +1,6 @@
 import type { ArtifactKind, ArtifactRecord, ProjectBundle, WorkflowState } from './types';
 import { isMasterEligible, timelineHasCaptions, validateReleaseManifest } from '../release';
+import { parseParticipationManifest, ParticipationManifestError } from './participation';
 
 export const WORKFLOW_SEQUENCE: readonly WorkflowState[] = [
   'IDEA', 'BRIEF_READY', 'GREENLIT', 'BIBLE_LOCKED', 'OUTLINE_LOCKED', 'SCRIPT_DRAFT', 'SCRIPT_LOCKED',
@@ -38,6 +39,7 @@ function contractValid(artifact: ArtifactRecord): boolean {
     case 'story-bible': return nonEmpty(content.theme) && nonEmpty(content.engine) && Array.isArray(content.worldRules) && content.worldRules.length >= 2;
     case 'character-canon': return Array.isArray(content.characters) && content.characters.length > 0;
     case 'episode-beats': return Array.isArray(content.beats) && content.beats.length >= 3;
+    case 'participation-manifest': return content.schema === 'openwood.participation/v1' && Array.isArray(content.prompts) && content.prompts.length > 0;
     case 'screenplay': return Array.isArray(content.scenes) && content.scenes.length > 0;
     case 'coverage-report': return Object.keys(content).filter((key) => key !== 'summary').length >= 2;
     case 'director-treatment': return Object.keys(content).filter((key) => key !== 'summary').length >= 3;
@@ -91,6 +93,18 @@ const FINAL_CHAIN_ARTIFACTS: readonly ArtifactKind[] = [
 function validateFinalChain(bundle: ProjectBundle, reasons: string[]): void {
   const artifact = (kind: ArtifactKind) => bundle.artifacts.find((candidate) => candidate.kind === kind);
   requireArtifacts(bundle, reasons, FINAL_CHAIN_ARTIFACTS);
+  const participation = artifact('participation-manifest');
+  if (participation) {
+    if (!accepted(participation)) reasons.push('The participation manifest must be approved or locked when Story Doors are included.');
+    else {
+      try {
+        parseParticipationManifest(participation.content, bundle.project);
+      } catch (error) {
+        if (error instanceof ParticipationManifestError) reasons.push(...error.reasons.map((reason) => `Story Door: ${reason}`));
+        else reasons.push('The participation manifest could not be validated.');
+      }
+    }
+  }
   if (bundle.assets.length === 0) reasons.push('At least one real production asset is required in the final package.');
   if (bundle.assets.some((asset) => asset.rightsStatus !== 'cleared')) reasons.push('Every asset pinned into the final package must have cleared rights.');
   if (!rightsCleared(artifact('rights-ledger'))) reasons.push('Every release source must include ownership, license, and affirmative consent or an explicit not-applicable attestation.');

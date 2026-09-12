@@ -13,6 +13,7 @@ import {
   Check,
   Clock3,
   Download,
+  DoorOpen,
   Eye,
   FileJson,
   Film,
@@ -32,13 +33,15 @@ import {
   X,
 } from 'lucide-react';
 import type { AgentProfile, ArtifactRecord, ProjectBundle, WorkflowState } from '@/lib/domain/types';
+import type { AudiencePulse } from '@/lib/domain/participation';
 
-type ViewId = 'board' | 'story' | 'script' | 'shots' | 'cut' | 'agents' | 'release';
+type ViewId = 'board' | 'story' | 'audience' | 'script' | 'shots' | 'cut' | 'agents' | 'release';
 type ProviderStatus = { configured: boolean; type: string; model: string | null; baseUrl: string | null; hasCredential: boolean };
 
 const views: Array<{ id: ViewId; label: string; icon: typeof Gauge }> = [
   { id: 'board', label: 'Showrunner board', icon: Gauge },
   { id: 'story', label: 'Story room', icon: BookOpen },
+  { id: 'audience', label: 'Audience room', icon: DoorOpen },
   { id: 'script', label: 'Screenplay', icon: PenLine },
   { id: 'shots', label: 'Look & shots', icon: Aperture },
   { id: 'cut', label: 'Cut room', icon: Film },
@@ -49,6 +52,7 @@ const views: Array<{ id: ViewId; label: string; icon: typeof Gauge }> = [
 const viewKinds: Record<ViewId, string[]> = {
   board: ['creative-brief', 'greenlight-memo', 'coverage-report'],
   story: ['story-bible', 'character-canon', 'episode-beats', 'continuity-ledger'],
+  audience: ['participation-manifest'],
   script: ['screenplay', 'coverage-report'],
   shots: ['director-treatment', 'visual-bible', 'shot-plan', 'performance-bible', 'sound-cue-sheet', 'asset-production-plan', 'continuity-ledger', 'rights-ledger'],
   cut: ['edit-timeline', 'quality-report'],
@@ -57,18 +61,18 @@ const viewKinds: Record<ViewId, string[]> = {
 };
 
 const viewStages: Record<ViewId, readonly string[]> = {
-  board: ['brief'], story: ['bible', 'outline'], script: ['script', 'coverage'],
+  board: ['brief'], story: ['bible', 'outline'], audience: ['participation'], script: ['script', 'coverage'],
   shots: ['direction', 'look', 'shots', 'sound', 'continuity', 'assets', 'rights'], cut: ['cut', 'qc'], agents: [], release: [],
 };
 
 const stageAgentIds: Record<string, string> = {
-  brief: 'executive-producer', bible: 'showrunner', outline: 'story-architect', script: 'screenwriter', coverage: 'script-editor',
+  brief: 'executive-producer', bible: 'showrunner', outline: 'story-architect', participation: 'audience-dramaturg', script: 'screenwriter', coverage: 'script-editor',
   direction: 'director', look: 'production-designer', shots: 'cinematographer', sound: 'performance-sound-director',
   continuity: 'continuity-supervisor', assets: 'asset-producer', rights: 'rights-safety-producer', cut: 'editor', qc: 'final-critic',
 };
 
 const stageOutputs: Record<string, readonly ArtifactRecord['kind'][]> = {
-  brief: ['greenlight-memo'], bible: ['story-bible', 'character-canon'], outline: ['episode-beats'], script: ['screenplay'], coverage: ['coverage-report'],
+  brief: ['greenlight-memo'], bible: ['story-bible', 'character-canon'], outline: ['episode-beats'], participation: ['participation-manifest'], script: ['screenplay'], coverage: ['coverage-report'],
   direction: ['director-treatment'], look: ['visual-bible'], shots: ['shot-plan'], sound: ['performance-bible', 'sound-cue-sheet'],
   continuity: ['continuity-ledger'], assets: ['asset-production-plan'], rights: ['rights-ledger'], cut: ['edit-timeline'], qc: ['quality-report'],
 };
@@ -184,10 +188,67 @@ function TimelineView({ artifact }: { artifact: ArtifactRecord }) {
   );
 }
 
-function ArtifactBody({ artifact }: { artifact: ArtifactRecord }) {
+function StoryDoorView({
+  artifact,
+  pulses,
+  canOperate,
+  operatingPromptId,
+  onSetStatus,
+}: {
+  artifact: ArtifactRecord;
+  pulses: AudiencePulse[];
+  canOperate: boolean;
+  operatingPromptId: string | null;
+  onSetStatus: (promptId: string, status: 'open' | 'closed') => void;
+}) {
+  const prompts = records(artifact.content.prompts);
+  return (
+    <div className="audience-manifest">
+      <header>
+        <span><DoorOpen /></span>
+        <div><p className="kicker">Audience authorship · showrunner final cut</p><h2>Story Doors</h2><p>Each prompt invites a real dramatic opinion, names its cost, and makes an explicit promise about the next episode.</p></div>
+      </header>
+      {prompts.map((prompt, index) => {
+        const pulse = pulses.find((candidate) => candidate.prompt.id === prompt.id);
+        const promptId = text(prompt.id, String(index));
+        const status = pulse ? pulse.prompt.status : text(prompt.status) === 'closed' ? 'closed' : 'open';
+        return <article key={text(prompt.id, String(index))}>
+          <div className="audience-manifest-meta">
+            <span>Episode {text(prompt.episode)}</span><span>{text(prompt.mode)}</span><span>{status}</span>
+            {canOperate ? <button
+              type="button"
+              disabled={operatingPromptId !== null}
+              onClick={() => onSetStatus(promptId, status === 'open' ? 'closed' : 'open')}
+            >{operatingPromptId === promptId ? <LoaderCircle /> : <DoorOpen />} {status === 'open' ? 'Close signals' : 'Reopen signals'}</button> : null}
+          </div>
+          <h3>{text(prompt.question)}</h3>
+          <p>{text(prompt.context)}</p>
+          <div className="audience-manifest-options">{records(prompt.options).map((option, optionIndex) => <div key={text(option.id, String(optionIndex))}><strong>{text(option.label)}</strong><small>{text(option.dramaticCost)}</small></div>)}</div>
+          {pulse && pulse.totalSignals > 0 ? <div className="audience-manifest-pulse"><p><UsersRound /><strong>{pulse.totalSignals.toLocaleString()}</strong><span>measured signal{pulse.totalSignals === 1 ? '' : 's'}</span></p>{pulse.prompt.options.map((option) => <div key={option.id}><span>{option.label}</span><i><b style={{ width: `${Math.max(0, Math.min(100, option.percentage))}%` }} /></i><strong>{option.percentage}%</strong></div>)}</div> : <p className="audience-manifest-awaiting">Audience pulse will appear here from stored signals; OpenWood never invents an empty crowd.</p>}
+          <footer><strong>Payoff contract</strong><span>{text(prompt.promise)}</span><small>Audience input is {text(prompt.binding)}; the showrunner retains final cut.</small></footer>
+        </article>;
+      })}
+    </div>
+  );
+}
+
+function ArtifactBody({
+  artifact,
+  audiencePulses,
+  canOperateStoryDoors,
+  operatingPromptId,
+  onSetStoryDoorStatus,
+}: {
+  artifact: ArtifactRecord;
+  audiencePulses: AudiencePulse[];
+  canOperateStoryDoors: boolean;
+  operatingPromptId: string | null;
+  onSetStoryDoorStatus: (promptId: string, status: 'open' | 'closed') => void;
+}) {
   if (artifact.kind === 'screenplay' && Array.isArray(artifact.content.scenes)) return <ScreenplayView artifact={artifact} />;
   if (artifact.kind === 'shot-plan' && Array.isArray(artifact.content.shots)) return <ShotDeck artifact={artifact} />;
   if (artifact.kind === 'edit-timeline' && Array.isArray(artifact.content.tracks)) return <TimelineView artifact={artifact} />;
+  if (artifact.kind === 'participation-manifest' && Array.isArray(artifact.content.prompts)) return <StoryDoorView artifact={artifact} pulses={audiencePulses} canOperate={canOperateStoryDoors} operatingPromptId={operatingPromptId} onSetStatus={onSetStoryDoorStatus} />;
   return <ArtifactValue value={artifact.content} />;
 }
 
@@ -195,6 +256,8 @@ export function ProductionWorkspace({ productionId }: { productionId: string }) 
   const [bundle, setBundle] = useState<ProjectBundle | null>(null);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [provider, setProvider] = useState<ProviderStatus | null>(null);
+  const [audiencePulses, setAudiencePulses] = useState<AudiencePulse[]>([]);
+  const [operatingPromptId, setOperatingPromptId] = useState<string | null>(null);
   const [view, setView] = useState<ViewId>('board');
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [selectedStage, setSelectedStage] = useState<string>('brief');
@@ -210,6 +273,23 @@ export function ProductionWorkspace({ productionId }: { productionId: string }) 
     if (!response.ok) throw new Error(data.error ?? 'Production could not be loaded.');
     setBundle(data);
   }, [productionId]);
+
+  const refreshAudiencePulses = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/projects/${productionId}/pulse`, { cache: 'no-store' });
+      if (!response.ok) { setAudiencePulses([]); return; }
+      const data = await response.json() as { pulses?: AudiencePulse[] };
+      setAudiencePulses(data.pulses ?? []);
+    } catch {
+      setAudiencePulses([]);
+    }
+  }, [productionId]);
+
+  useEffect(() => {
+    if (view !== 'audience') return;
+    const refreshTimer = window.setTimeout(() => void refreshAudiencePulses(), 0);
+    return () => window.clearTimeout(refreshTimer);
+  }, [refreshAudiencePulses, view]);
 
   useEffect(() => {
     let active = true;
@@ -260,6 +340,27 @@ export function ProductionWorkspace({ productionId }: { productionId: string }) 
       setMessage(error instanceof Error ? error.message : 'The agent stage failed.');
       await refresh().catch(() => undefined);
     } finally { setRunning(false); }
+  }
+
+  async function setStoryDoorOperationalStatus(promptId: string, status: 'open' | 'closed') {
+    if (!bundle || operatingPromptId) return;
+    setOperatingPromptId(promptId);
+    setMessage(`${status === 'open' ? 'Reopening' : 'Closing'} the released Story Door…`);
+    try {
+      const response = await fetch(`/api/projects/${bundle.project.id}/pulse`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio' },
+        body: JSON.stringify({ promptId, status }),
+      });
+      const data = await response.json() as { pulse?: AudiencePulse; error?: string };
+      if (!response.ok || !data.pulse) throw new Error(data.error ?? 'The Story Door state could not be updated.');
+      setAudiencePulses((current) => [...current.filter((pulse) => pulse.prompt.id !== promptId), data.pulse as AudiencePulse]);
+      setMessage(`Story Door signals are now ${status}. The pinned dramatic contract is unchanged.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'The Story Door state could not be updated.');
+    } finally {
+      setOperatingPromptId(null);
+    }
   }
 
   function beginEdit() {
@@ -452,7 +553,13 @@ export function ProductionWorkspace({ productionId }: { productionId: string }) 
           ) : selectedArtifact ? (
             <article className="artifact-document">
               <header><div><span className={`artifact-status status-${selectedArtifact.status}`}>{selectedArtifact.status}</span><span>{selectedArtifact.kind.replaceAll('-', ' ')}</span></div><div><span>Version {selectedArtifact.version}</span><span>Credit · {agents.find((agent) => agent.id === selectedArtifact.createdBy)?.name ?? selectedArtifact.createdBy}</span></div></header>
-              <ArtifactBody artifact={selectedArtifact} />
+              <ArtifactBody
+                artifact={selectedArtifact}
+                audiencePulses={audiencePulses}
+                canOperateStoryDoors={project.mode !== 'demo' && project.state === 'RELEASED'}
+                operatingPromptId={operatingPromptId}
+                onSetStoryDoorStatus={(promptId, status) => void setStoryDoorOperationalStatus(promptId, status)}
+              />
             </article>
           ) : (
             <div className="authored-empty"><Layers3 /><h2>This department has no artifact yet.</h2><p>{provider?.configured ? `Run the ${activeStage ?? 'next'} stage to create a structured first revision, or author it yourself.` : 'Manual mode is active. Create a blank structured draft and author every field yourself, or configure a server-side OpenAI-compatible provider.'}</p>{!readOnly && activeStage ? <button onClick={createManualArtifact}><PenLine /> Create manual draft</button> : null}</div>

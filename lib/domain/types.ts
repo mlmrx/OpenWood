@@ -24,6 +24,7 @@ export const ARTIFACT_KINDS = [
   'story-bible',
   'character-canon',
   'episode-beats',
+  'participation-manifest',
   'screenplay',
   'coverage-report',
   'director-treatment',

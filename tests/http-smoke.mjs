@@ -3,7 +3,17 @@ import { readFile } from 'node:fs/promises';
 import { File } from 'node:buffer';
 
 const baseUrl = process.env.OPENWOOD_BASE_URL ?? 'http://localhost:3001';
+const fakeProviderUrl = process.env.OPENWOOD_FAKE_MODEL_PROVIDER_URL?.replace(/\/+$/, '');
+const expectedAudienceLimitRaw = process.env.OPENWOOD_EXPECT_AUDIENCE_LIMIT;
+const expectedAudienceLimit = expectedAudienceLimitRaw === undefined ? null : Number(expectedAudienceLimitRaw);
+if (expectedAudienceLimitRaw !== undefined) {
+  assert.ok(
+    Number.isInteger(expectedAudienceLimit) && expectedAudienceLimit >= 10,
+    'OPENWOOD_EXPECT_AUDIENCE_LIMIT must be an integer of at least 10.',
+  );
+}
 let cookie = '';
+let theaterCookie = '';
 
 async function request(path, init = {}) {
   const headers = new Headers(init.headers);
@@ -23,8 +33,29 @@ async function publicRequest(path, init = {}) {
   return { response, body };
 }
 
+async function theaterRequest(path, init = {}) {
+  const headers = new Headers(init.headers);
+  if (theaterCookie) headers.set('cookie', theaterCookie);
+  const response = await fetch(`${baseUrl}${path}`, { ...init, headers, redirect: 'manual' });
+  const setCookie = response.headers.get('set-cookie');
+  if (setCookie) theaterCookie = setCookie.split(';', 1)[0];
+  const contentType = response.headers.get('content-type') ?? '';
+  const body = contentType.includes('json') ? await response.json() : await response.text();
+  return { response, body };
+}
+
 const results = [];
 function passed(name, detail = '') { results.push({ name, detail, passed: true }); }
+
+async function pollUntil(name, probe, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await probe();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for ${name}.`);
+}
 
 const health = await request('/api/health');
 assert.equal(health.response.status, 200);
@@ -46,6 +77,15 @@ const captions = await request('/api/projects/prj_dead_air/captions');
 assert.equal(captions.response.status, 200);
 assert.match(captions.body, /^WEBVTT/);
 passed('public WebVTT captions');
+
+const storyworld = await publicRequest('/api/worlds/dead-air');
+assert.equal(storyworld.response.status, 200);
+assert.equal(storyworld.body.schema, 'openwood.storyworld/v1');
+assert.ok(storyworld.body.participation.artifact.id);
+assert.equal(storyworld.body.participation.artifact.version, 1);
+assert.equal(Object.hasOwn(storyworld.body, 'issues'), false);
+assert.equal(Object.hasOwn(storyworld.body, 'assets'), false);
+passed('portable public storyworld excludes private production data');
 
 const rejectedCsrf = await request('/api/projects', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
@@ -71,7 +111,8 @@ assert.equal(create.body.artifacts[0].status, 'approved');
 passed('persistent production creation', project.id);
 
 const provider = await request('/api/provider');
-if (!provider.body.provider.configured) {
+const planningProvider = provider.body.provider.routes.find((route) => route.lane === 'planning');
+if (!planningProvider?.configured) {
   const run = await request(`/api/projects/${project.id}/run`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio', 'idempotency-key': `smoke-${project.id}` },
@@ -84,6 +125,75 @@ if (!provider.body.provider.configured) {
   const events = await request(`/api/runs/${run.body.runId}/events`);
   assert.deepEqual(events.body.events.map((event) => event.type), ['started', 'failed']);
   passed('fail-loud provider run and durable event ledger', run.body.runId);
+} else {
+  const creativeBrief = create.body.artifacts.find((artifact) => artifact.kind === 'creative-brief');
+  assert.ok(creativeBrief);
+  const originalContentRevision = create.body.project.contentRevision;
+  const runPromise = request(`/api/projects/${project.id}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio', 'idempotency-key': `stale-brief-${project.id}` },
+    body: JSON.stringify({ stage: 'brief' }),
+  });
+
+  const runningRun = await pollUntil('brief run to become observably running', async () => {
+    const bundle = await request(`/api/projects/${project.id}`);
+    assert.equal(bundle.response.status, 200);
+    return bundle.body.runs.find((run) => run.stage === 'brief' && run.status === 'running');
+  });
+
+  if (fakeProviderUrl) {
+    await pollUntil('fake provider to hold the model request', async () => {
+      const response = await fetch(`${fakeProviderUrl}/health`);
+      if (!response.ok) return false;
+      const status = await response.json();
+      return status.waiting > 0;
+    });
+  }
+
+  const humanRevisionNote = 'Human edit while the brief model run was pending.';
+  const revisedBrief = await request(`/api/artifacts/${creativeBrief.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio' },
+    body: JSON.stringify({
+      projectId: project.id,
+      kind: creativeBrief.kind,
+      title: creativeBrief.title,
+      status: 'approved',
+      baseVersion: creativeBrief.version,
+      content: { ...creativeBrief.content, revisionNote: humanRevisionNote },
+    }),
+  });
+  assert.equal(revisedBrief.response.status, 200);
+  assert.equal(revisedBrief.body.artifact.version, creativeBrief.version + 1);
+
+  if (fakeProviderUrl) {
+    const release = await fetch(`${fakeProviderUrl}/release`, { method: 'POST' });
+    assert.equal(release.status, 200);
+  }
+
+  const superseded = await runPromise;
+  assert.equal(superseded.response.status, 409);
+  assert.equal(superseded.body.runId, runningRun.id);
+  assert.match(superseded.body.error, /stale result was superseded/i);
+
+  const afterConflict = await request(`/api/projects/${project.id}`);
+  assert.equal(afterConflict.response.status, 200);
+  assert.equal(afterConflict.body.project.state, 'BRIEF_READY');
+  assert.equal(afterConflict.body.project.contentRevision, originalContentRevision + 1);
+  const preservedBrief = afterConflict.body.artifacts.find((artifact) => artifact.kind === 'creative-brief');
+  assert.equal(preservedBrief.version, creativeBrief.version + 1);
+  assert.equal(preservedBrief.content.revisionNote, humanRevisionNote);
+  assert.equal(afterConflict.body.artifacts.some((artifact) => artifact.kind === 'greenlight-memo'), false);
+  assert.equal(afterConflict.body.issues.length, 0);
+
+  const runStatus = await request(`/api/runs/${runningRun.id}`);
+  assert.equal(runStatus.response.status, 200);
+  assert.equal(runStatus.body.run.status, 'failed');
+  assert.match(runStatus.body.run.error, /stale result was superseded/i);
+  const events = await request(`/api/runs/${runningRun.id}/events`);
+  assert.equal(events.response.status, 200);
+  assert.deepEqual(events.body.events.map((event) => event.type), ['started', 'failed']);
+  passed('atomic stage commit rejects a stale provider result', runningRun.id);
 }
 
 const blocked = await request(`/api/projects/${project.id}/transition`, {
@@ -186,6 +296,31 @@ await createApprovedArtifact('story-bible', 'Story bible', { theme: 'Choice has 
 await createApprovedArtifact('character-canon', 'Character canon', { characters: [{ name: 'Iris Vale', want: 'To preserve audience agency', contradiction: 'She cannot stop watching' }] });
 await advance('BIBLE_LOCKED');
 await createApprovedArtifact('episode-beats', 'Pilot beat map', { beats: [{ at: 0, turn: 'The frame changes' }, { at: 25, turn: 'Iris tests the print' }, { at: 55, turn: 'The audience arrives' }] });
+await createApprovedArtifact('participation-manifest', 'Pilot Story Door', {
+  schema: 'openwood.participation/v1',
+  prompts: [{
+    id: 'acceptance-door', episode: 1, trigger: { kind: 'end', atSeconds: 2 }, mode: 'prediction',
+    question: 'Which risk should Iris take when the house lights fall?',
+    context: 'The final frame now shows a choice the audience has not made.',
+    options: [
+      { id: 'stop-projector', label: 'Stop the projector', dramaticCost: 'The audience may turn on Iris before she can explain.' },
+      { id: 'show-frame', label: 'Show the impossible frame', dramaticCost: 'The image could make the predicted choice inevitable.' },
+    ],
+    binding: 'advisory', promise: 'The next episode will confront the cost of Iris watching.', status: 'open',
+  }],
+});
+const privatePulse = await theaterRequest(`/api/watch/${project.slug}/pulse`);
+assert.equal(privatePulse.response.status, 404);
+const audienceSetCookie = privatePulse.response.headers.get('set-cookie') ?? '';
+assert.match(cookie, /^openwood_workspace=[a-f0-9]{48}$/);
+assert.match(theaterCookie, /^openwood_audience=[a-f0-9]{48}$/);
+assert.notEqual(theaterCookie, cookie);
+assert.match(audienceSetCookie, /^openwood_audience=/i);
+assert.match(audienceSetCookie, /(?:^|;\s*)Path=\/api\/watch(?:;|$)/i);
+assert.doesNotMatch(audienceSetCookie, /openwood_workspace/i);
+const privateOwnerPulse = await publicRequest(`/api/projects/${project.id}/pulse`);
+assert.equal(privateOwnerPulse.response.status, 404);
+passed('unreleased Story Door privacy and scoped audience identity');
 await advance('OUTLINE_LOCKED');
 await createApprovedArtifact('screenplay', 'Pilot screenplay', { scenes: [{ slugline: 'INT. PROJECTION BOOTH — NIGHT', action: 'Iris freezes the final frame before the house doors open.', dialogue: [{ speaker: 'IRIS', line: 'No one sees this until I know who chose it.' }] }] });
 await advance('SCRIPT_DRAFT');
@@ -252,6 +387,151 @@ const releasedCaptions = await publicRequest(`/api/projects/${project.id}/captio
 assert.equal(releasedCaptions.response.status, 200);
 assert.match(releasedCaptions.body, /OpenWood acceptance master\./);
 passed('public screening exposes only manifest-pinned playback deliverables');
+
+const pulse = await theaterRequest(`/api/watch/${project.slug}/pulse`);
+assert.equal(pulse.response.status, 200);
+assert.equal(pulse.body.pulse.prompt.id, 'acceptance-door');
+assert.equal(pulse.body.pulse.totalSignals, 0);
+assert.doesNotMatch(JSON.stringify(pulse.body), /viewer[_A-Z]?key|workspace[_A-Z]?id/i);
+
+const episodeOnePulse = await theaterRequest(`/api/watch/${project.slug}/pulse?episode=1`);
+assert.equal(episodeOnePulse.response.status, 200);
+assert.equal(episodeOnePulse.body.pulse.prompt.episode, 1);
+assert.equal(episodeOnePulse.body.pulse.prompt.id, 'acceptance-door');
+const missingEpisodePulse = await theaterRequest(`/api/watch/${project.slug}/pulse?episode=2`);
+assert.equal(missingEpisodePulse.response.status, 404);
+passed('Story Door episode addressing');
+
+const closedDoor = await request(`/api/projects/${project.id}/pulse`, {
+  method: 'PATCH', headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio' },
+  body: JSON.stringify({ promptId: 'acceptance-door', status: 'closed' }),
+});
+assert.equal(closedDoor.response.status, 200);
+assert.equal(closedDoor.body.pulse.prompt.status, 'closed');
+const closedPublicPulse = await theaterRequest(`/api/watch/${project.slug}/pulse?episode=1`);
+assert.equal(closedPublicPulse.response.status, 200);
+assert.equal(closedPublicPulse.body.pulse.prompt.status, 'closed');
+const closedStoryworld = await publicRequest(`/api/worlds/${project.slug}`);
+assert.equal(closedStoryworld.response.status, 200);
+assert.equal(closedStoryworld.body.participation.prompts[0].status, 'closed');
+const closedSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'stop-projector' }),
+});
+assert.equal(closedSignal.response.status, 409);
+const reopenedDoor = await request(`/api/projects/${project.id}/pulse`, {
+  method: 'PATCH', headers: { 'content-type': 'application/json', 'x-openwood-request': 'studio' },
+  body: JSON.stringify({ promptId: 'acceptance-door', status: 'open' }),
+});
+assert.equal(reopenedDoor.response.status, 200);
+assert.equal(reopenedDoor.body.pulse.prompt.status, 'open');
+const reopenedStoryworld = await publicRequest(`/api/worlds/${project.slug}`);
+assert.equal(reopenedStoryworld.response.status, 200);
+assert.equal(reopenedStoryworld.body.participation.prompts[0].status, 'open');
+passed('owner Story Door close and reopen propagate to the public storyworld');
+
+const headerlessSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'stop-projector' }),
+});
+assert.equal(headerlessSignal.response.status, 403);
+const crossOriginSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater', origin: 'https://example.invalid' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'stop-projector' }),
+});
+assert.equal(crossOriginSignal.response.status, 403);
+
+const firstSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'stop-projector' }),
+});
+assert.equal(firstSignal.response.status, 201);
+assert.equal(firstSignal.body.pulse.selectedOptionId, 'stop-projector');
+assert.equal(firstSignal.body.pulse.totalSignals, 1);
+
+const cooldownSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'show-frame' }),
+});
+assert.equal(cooldownSignal.response.status, 429);
+assert.equal(cooldownSignal.body.details.code, 'story-door-change-cooldown');
+const cooldownRetryAfter = Number(cooldownSignal.response.headers.get('retry-after'));
+assert.ok(Number.isInteger(cooldownRetryAfter) && cooldownRetryAfter >= 1);
+await new Promise((resolve) => setTimeout(resolve, cooldownRetryAfter * 1_000 + 250));
+
+const changedSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'show-frame' }),
+});
+assert.equal(changedSignal.response.status, 200);
+assert.equal(changedSignal.body.pulse.selectedOptionId, 'show-frame');
+assert.equal(changedSignal.body.pulse.totalSignals, 1);
+assert.equal(changedSignal.body.pulse.prompt.options.find((option) => option.id === 'stop-projector').signals, 0);
+assert.equal(changedSignal.body.pulse.prompt.options.find((option) => option.id === 'show-frame').signals, 1);
+
+const secondViewerBeforeChoice = await publicRequest(`/api/watch/${project.slug}/pulse`);
+assert.equal(secondViewerBeforeChoice.response.status, 200);
+assert.equal(secondViewerBeforeChoice.body.pulse.selectedOptionId, null);
+assert.equal(secondViewerBeforeChoice.body.pulse.totalSignals, 0);
+assert.ok(secondViewerBeforeChoice.body.pulse.prompt.options.every((option) => option.signals === 0 && option.percentage === 0));
+
+const repeatedSignal = await theaterRequest(`/api/watch/${project.slug}/pulse`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-openwood-request': 'theater' },
+  body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'show-frame' }),
+});
+assert.equal(repeatedSignal.response.status, 200);
+assert.equal(repeatedSignal.body.pulse.totalSignals, 1);
+
+const persistedPulse = await theaterRequest(`/api/watch/${project.slug}/pulse`);
+assert.equal(persistedPulse.response.status, 200);
+assert.equal(persistedPulse.body.pulse.selectedOptionId, 'show-frame');
+assert.equal(persistedPulse.body.pulse.totalSignals, 1);
+assert.doesNotMatch(JSON.stringify(persistedPulse.body), /viewer[_A-Z]?key|workspace[_A-Z]?id/i);
+
+const ownerPulse = await request(`/api/projects/${project.id}/pulse`);
+assert.equal(ownerPulse.response.status, 200);
+assert.equal(ownerPulse.body.pulses[0].totalSignals, 1);
+assert.doesNotMatch(JSON.stringify(ownerPulse.body), /viewer[_A-Z]?key|workspace[_A-Z]?id/i);
+passed('Story Door cooldown, persistence, idempotency, change semantics, and aggregate privacy');
+
+if (expectedAudienceLimit !== null) {
+  let acceptedWriteAttempts = 2; // The first signal and the later changed choice both consume the project window.
+  const successfulNewViewers = expectedAudienceLimit - acceptedWriteAttempts;
+  for (let index = 0; index < successfulNewViewers; index += 1) {
+    const token = (0x100000000000n + BigInt(index)).toString(16).padStart(48, '0');
+    const acceptedSignal = await publicRequest(`/api/watch/${project.slug}/pulse`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-openwood-request': 'theater',
+        cookie: `openwood_audience=${token}`,
+      },
+      body: JSON.stringify({ promptId: 'acceptance-door', optionId: index % 2 === 0 ? 'stop-projector' : 'show-frame' }),
+    });
+    assert.equal(acceptedSignal.response.status, 201, `audience write ${acceptedWriteAttempts + 1} should fit within the configured project cap`);
+    acceptedWriteAttempts += 1;
+  }
+  assert.equal(acceptedWriteAttempts, expectedAudienceLimit);
+
+  const overflowToken = (0x200000000000n + BigInt(expectedAudienceLimit)).toString(16).padStart(48, '0');
+  const limitedSignal = await publicRequest(`/api/watch/${project.slug}/pulse`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-openwood-request': 'theater',
+      cookie: `openwood_audience=${overflowToken}`,
+    },
+    body: JSON.stringify({ promptId: 'acceptance-door', optionId: 'stop-projector' }),
+  });
+  assert.equal(limitedSignal.response.status, 429);
+  assert.equal(limitedSignal.body.details.code, 'story-door-project-rate-limit');
+  assert.ok(Number(limitedSignal.response.headers.get('retry-after')) >= 1);
+
+  const cappedOwnerPulse = await request(`/api/projects/${project.id}/pulse`);
+  assert.equal(cappedOwnerPulse.response.status, 200);
+  assert.equal(cappedOwnerPulse.body.pulses[0].totalSignals, expectedAudienceLimit - 1);
+  passed('project Story Door attempt cap is exact and returns retry guidance', `${expectedAudienceLimit} accepted writes`);
+}
 
 const exported = await request(`/api/projects/${project.id}/export`);
 assert.equal(exported.response.status, 200);

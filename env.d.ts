@@ -7,5 +7,6 @@ declare namespace Cloudflare {
     OPENWOOD_PUBLIC_ORIGIN?: string;
     OPENWOOD_MAX_RUNS_PER_DAY?: string;
     OPENWOOD_MAX_DEPLOYMENT_RUNS_PER_DAY?: string;
+    OPENWOOD_AUDIENCE_SIGNALS_PER_PROJECT_MINUTE?: string;
   }
 }

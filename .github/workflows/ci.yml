@@ -25,10 +25,57 @@ jobs:
       - run: npm run build
       - name: HTTP acceptance against D1 and R2 emulation
         shell: bash
+        env:
+          OPENWOOD_PLANNING_LLM_BASE_URL: http://127.0.0.1:1919/v1
+          OPENWOOD_PLANNING_LLM_MODEL: openwood-fixture
+          OPENWOOD_PLANNING_LLM_JSON_MODE: prompt
+          OPENWOOD_FAKE_MODEL_PROVIDER_URL: http://127.0.0.1:1919
+          OPENWOOD_AUDIENCE_SIGNALS_PER_PROJECT_MINUTE: 10
+          OPENWOOD_EXPECT_AUDIENCE_LIMIT: 10
         run: |
-          ./node_modules/.bin/wrangler dev --config dist/server/wrangler.json --ip 127.0.0.1 --port 3001 > /tmp/openwood-server.log 2>&1 &
+          provider_log=/tmp/openwood-provider.log
+          server_log=/tmp/openwood-server.log
+          server_pid=
+          node tests/fake-model-provider.mjs > "$provider_log" 2>&1 &
+          provider_pid=$!
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ -n "$server_pid" ]; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            kill "$provider_pid" 2>/dev/null || true
+            wait "$provider_pid" 2>/dev/null || true
+            if [ "$status" -ne 0 ]; then
+              echo "OpenWood fake provider log:"
+              cat "$provider_log" 2>/dev/null || true
+              echo "OpenWood Worker log:"
+              cat "$server_log" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          provider_ready=0
+          for attempt in {1..50}; do
+            if curl --fail --silent http://127.0.0.1:1919/health >/dev/null; then
+              provider_ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [ "$provider_ready" -ne 1 ]; then
+            exit 1
+          fi
+
+          ./node_modules/.bin/wrangler dev --config dist/server/wrangler.json --ip 127.0.0.1 --port 3001 \
+            --var "OPENWOOD_PLANNING_LLM_BASE_URL:$OPENWOOD_PLANNING_LLM_BASE_URL" \
+            --var "OPENWOOD_PLANNING_LLM_MODEL:$OPENWOOD_PLANNING_LLM_MODEL" \
+            --var "OPENWOOD_PLANNING_LLM_JSON_MODE:$OPENWOOD_PLANNING_LLM_JSON_MODE" \
+            --var "OPENWOOD_AUDIENCE_SIGNALS_PER_PROJECT_MINUTE:$OPENWOOD_AUDIENCE_SIGNALS_PER_PROJECT_MINUTE" \
+            > "$server_log" 2>&1 &
           server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           ready=0
           for attempt in {1..90}; do
             if curl --fail --silent http://127.0.0.1:3001/api/health >/dev/null; then
@@ -38,8 +85,7 @@ jobs:
             sleep 1
           done
           if [ "$ready" -ne 1 ]; then
-            cat /tmp/openwood-server.log
             exit 1
           fi
-          npm run test:smoke || { cat /tmp/openwood-server.log; exit 1; }
+          npm run test:smoke
       - run: npm audit --omit=dev --audit-level=high

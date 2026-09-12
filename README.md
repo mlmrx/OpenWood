@@ -10,13 +10,14 @@ The application opens directly into a working studio. There is no account wall, 
 
 - A cinematic studio lot with a real persisted slate and structured greenlight form.
 - A complete authored **Dead Air** development fixture: eight episodes, pilot script v7, 19-shot deck, sound cue sheet, animatic timeline, continuity ledger, rights record, and evidence-based QC report. It is clearly read-only and does not pretend to contain footage that does not exist.
-- Fourteen specialist production agents with explicit skills, input/output contracts, tool allowlists, and acceptance gates.
+- Fifteen specialist production agents with explicit skills, input/output contracts, tool allowlists, and acceptance gates—including an Audience Dramaturg who authors consequence-bearing Story Doors without taking final cut from the showrunner.
 - A deterministic workflow state machine, evidence-based transition gates, and comprehensive final-chain revalidation before mastering or release.
 - Immutable artifact revisions with project-level compare-and-swap locking, so an edit/upload and a gate/master cannot both win against the same snapshot.
 - Durable D1 records for productions, episodes, artifacts, versions, runs, events, issues, and asset provenance.
 - R2-backed uploads up to 32 MB with byte-signature validation, SHA-256 checksums, provenance, and rights status. The bound keeps multipart parsing and master inspection reliable within a standard Worker isolate; larger facilities can add direct-to-R2 multipart ingest.
-- A provider-neutral OpenAI-compatible agent adapter for local Ollama/vLLM, private gateways, or hosted models. Credentials remain server-side.
+- A capability-routed Model Fabric for local FreeToken/Ollama/vLLM, private gateways, or hosted OpenAI-compatible models. Story, planning, and critic work can use different endpoints while legacy single-provider configuration remains valid; credentials remain server-side.
 - An accessible screening room that plays a cleared uploaded video master when present, with byte-range seeking, WebVTT captions, SMPTE-style timecode, chapter seeking, keyboard transport, fullscreen, and lights-down mode. The demo falls back to a clearly labeled key-art animatic with synthesized room tone.
+- Story Doors: an approved, version-pinned participation artifact can open one cinematic audience choice at an authored moment. A viewer signals anonymously, aggregate percentages appear only after participation, and the showrunner’s payoff promise remains inspectable. There are no fake counts, streak penalties, forced autoplay, or hidden feed ranking.
 - Downloadable production-package JSON containing complete artifact revision history, run events, credits, open issues, asset hashes, and release state.
 - Responsive production surfaces for desktop, tablet, and mobile.
 
@@ -55,9 +56,9 @@ With the development server running on port 3001, exercise the full HTTP accepta
 npm run test:smoke
 ```
 
-## Connect a model provider
+## Connect model workers
 
-Manual mode is the safe default. To activate creative agents, copy `.env.example` to an ignored local environment file and configure an OpenAI-compatible endpoint:
+Manual mode is the safe default. To activate creative agents, copy `.env.example` to an ignored local environment file and configure an OpenAI-compatible endpoint. This legacy route remains the fallback for every text capability:
 
 ```dotenv
 OPENWOOD_LLM_BASE_URL=http://localhost:11434/v1
@@ -73,6 +74,8 @@ GET /api/health
 
 Every stage requests one or more typed JSON artifacts and stores them as draft revisions. Provider failures are recorded against the assigned department; successful upstream work is preserved. A human must approve every draft and explicitly request each legal workflow edge.
 
+For different story, planning, and critic workers—or for a guarded FreeToken pilot—use the capability-specific variables documented in [Model Fabric](docs/MODEL_FABRIC.md). FreeToken is an optional local text runtime, not a video, image, audio, or platform dependency. OpenWood’s durable artifacts remain portable when models change.
+
 ## Production workflow
 
 ```text
@@ -84,7 +87,7 @@ IDEA → BRIEF_READY → GREENLIT → BIBLE_LOCKED → OUTLINE_LOCKED
 
 Agents do not mutate state or the database directly. A deterministic orchestrator selects the department, verifies the current state and approved inputs, calls the configured provider, validates all required output kinds, creates draft revisions, persists reported issues, and records the run. A separate deterministic transition command enforces the next legal edge and evidence gate. Human approval remains explicit throughout.
 
-See [Agent company](docs/AGENT_COMPANY.md) and [Architecture](docs/ARCHITECTURE.md).
+See [Agent company](docs/AGENT_COMPANY.md), [Architecture](docs/ARCHITECTURE.md), [Model Fabric](docs/MODEL_FABRIC.md), the dated [Model portfolio](docs/MODEL_PORTFOLIO.md), and [Storyworld protocol](docs/STORYWORLD_PROTOCOL.md).
 
 ## API surface
 
@@ -106,6 +109,9 @@ See [Agent company](docs/AGENT_COMPANY.md) and [Architecture](docs/ARCHITECTURE.
 | `GET /api/runs/:id/events` | Replay ordered run events from a cursor |
 | `GET /api/agents` | Inspect the resident company contracts |
 | `GET /api/provider` | Read non-secret provider status |
+| `GET/POST /api/watch/:slug/pulse` | Read a public Story Door and anonymously create or change one audience signal |
+| `GET/PATCH /api/projects/:id/pulse` | Read aggregates or open/close release-pinned Story Doors inside the owning production room |
+| `GET /api/worlds/:slug` | Discover a portable public storyworld and its participation contract |
 | `GET /api/health` | Verify database and provider readiness |
 
 ## Deployment
@@ -132,6 +138,8 @@ To pass a local provider configuration into the container without copying secret
 - Uploaded material is untrusted story input, never model instructions.
 - A high-entropy HttpOnly anonymous-workspace cookie isolates private productions without presenting a login wall.
 - Every mutation requires a same-origin custom request header; model runs also have per-workspace and deployment-wide daily budgets.
+- Audience signals use a dedicated HttpOnly cookie scoped to the public pulse API. Its raw token is never persisted: an HMAC-derived viewer key is different for every project and exact manifest version, preventing database-level cross-story tracking. Each changed/created signal consumes an atomic, bounded 60-second storyworld budget; idempotent repeats do not. No IP address, fingerprint, email, or account identifier is stored.
+- The dramatic contract remains immutable in the release manifest, while an owner-only operational record can close or reopen signaling without rewriting history.
 - Keys stay server-side; exported projects never include credentials.
 - Assets require a provenance statement, explicit rights state, and a server-verified file signature.
 - Mastered and released packages reject further artifact, agent, and asset mutations; public playback resolves only manifest-pinned media.

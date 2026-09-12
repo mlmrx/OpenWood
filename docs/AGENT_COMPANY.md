@@ -7,6 +7,7 @@ OpenWood’s agents are credited production departments, not chatbot personaliti
 | Studio | Sera Vale, Executive Producer | Audience promise, format, scope, greenlight | Creative brief, greenlight memo |
 | Story | Marlowe Reed, Showrunner | Series engine, world rules, arcs, tone | Story bible, character canon |
 | Story | Imani Cross, Story Architect | Hooks, causal beats, reversals, cliffhangers | Episode beat sheet |
+| Audience | Cass Rowan, Audience Dramaturg | Consequence design, predictions, honest audience pulse, payoff contracts | Participation manifest and Story Doors |
 | Writing | Noor Bishop, Screenwriter | Visual action, subtext, dialogue, timing | Structured screenplay |
 | Writing | Ruth Calder, Script Editor | Logic, cliché, compression, setup/payoff | Independent coverage report |
 | Direction | Aya Laurent, Director | Blocking, performance, coverage, transitions | Director treatment |
@@ -38,6 +39,7 @@ The independent critic cannot edit the work it grades. The rights producer can b
 - **Greenlight:** audience, runtime, aspect ratio, rating, originality position, boundaries, and rights declaration are explicit.
 - **Bible lock:** protagonist drive/flaw, antagonist pressure, story engine, world rules, arcs, motifs, and knowledge states are specific.
 - **Outline lock:** hook, causal escalation, reversal, emotional turn, cliffhanger, and runtime allocations are present.
+- **Participation:** every Story Door offers two to four genuinely distinct choices, states each dramatic cost, pins the exact artifact version, reports only measured participation, and preserves the showrunner’s final cut.
 - **Script lock:** no placeholders; every scene changes story state; dialogue, knowledge, continuity, and timing pass independent coverage.
 - **Pre-production lock:** every scene has intentional coverage; shot time reconciles; visual and performance continuity are addressable.
 - **Assets ready:** required files decode, meet spec, and carry hashes, provenance, and rights state.
